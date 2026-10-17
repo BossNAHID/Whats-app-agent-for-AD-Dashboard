@@ -1,9 +1,7 @@
 require('dotenv').config();
 
 // Safety net: log unexpected errors instead of letting one bad promise
-// crash the entire bridge and force a re-pair. The real fixes are the
-// batched Turso writes in turso-store.js/baileys-auth.js — this is just
-// a backstop in case something else slips through.
+// crash the entire bridge and force a re-pair.
 process.on('unhandledRejection', (err) => {
   console.error('[UNHANDLED REJECTION]', err);
 });
@@ -18,7 +16,12 @@ const path = require('path');
 const qrcode = require('qrcode');
 const pino = require('pino');
 const { Boom } = require('@hapi/boom');
-const { default: makeWASocket, DisconnectReason } = require('@whiskeysockets/baileys');
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  Browsers
+} = require('@whiskeysockets/baileys');
 const TursoKVStore = require('./turso-store');
 const useTursoAuthState = require('./baileys-auth');
 
@@ -27,12 +30,15 @@ const API_KEY = process.env.API_KEY || 'changeme';
 const MAPPING_FILE = path.join(__dirname, 'groups-config.json');
 const DEFAULT_ACCOUNT_ID = 'default';
 
+// Reconnect backoff (ms). Prevents the instant-reconnect loop that used to
+// hammer WhatsApp and never reach the QR stage when a handshake was rejected.
+const RECONNECT_BASE_MS = 3000;
+const RECONNECT_MAX_MS = 60000;
+
 // ---------- named admins ----------
-// ADMIN_KEYS lets more than one person use /admin, each with their own key,
-// instead of everyone sharing the single API_KEY. Format (comma-separated):
-//   ADMIN_KEYS=Nahid:long-random-string,Asif:another-long-random-string
-// The original API_KEY still works too (as an unnamed admin), so nothing
-// breaks for anyone still using the shared key.
+// ADMIN_KEYS lets more than one person use /admin, each with their own key.
+// Format (comma-separated): ADMIN_KEYS=Nahid:long-random,Asif:another-long-random
+// The original API_KEY still works too (as an unnamed admin).
 const ADMIN_KEYS = new Map(); // key string -> label
 (process.env.ADMIN_KEYS || '').split(',').forEach((entry) => {
   const idx = entry.indexOf(':');
@@ -43,11 +49,10 @@ const ADMIN_KEYS = new Map(); // key string -> label
 });
 
 // ---------- per-account state ----------
-// accounts[id] = { id, label, sock, isReady, userInfo, latestQr }
-// The very first account is always "default" and always uses bare Turso
-// keys (no prefix) — that's what makes this upgrade safe for an already
-// -connected number: it keeps reading/writing the exact same keys it
-// always did, so it does NOT need to re-scan a QR code.
+// accounts[id] = { id, label, sock, isReady, userInfo, latestQr,
+//                  lastStatus, lastError, retries, reconnectTimer }
+// The first account is always "default" and uses bare Turso keys (no prefix),
+// so an already-connected number keeps its session.
 const accounts = {};
 
 function keyPrefixFor(accountId) {
@@ -60,7 +65,9 @@ function publicAccountInfo(a) {
     label: a.label,
     ready: !!a.isReady,
     name: a.isReady && a.userInfo ? (a.userInfo.name || a.userInfo.id) : null,
-    deletable: a.id !== DEFAULT_ACCOUNT_ID
+    deletable: a.id !== DEFAULT_ACCOUNT_ID,
+    last_status: a.lastStatus || null,
+    last_error: a.lastError || null
   };
 }
 
@@ -78,6 +85,12 @@ function slugify(label) {
   }
   return candidate;
 }
+
+// ---------- Turso KV store ----------
+const kvStore = new TursoKVStore({
+  url: process.env.TURSO_DB_URL,
+  token: process.env.TURSO_DB_TOKEN
+});
 
 // ---------- accounts registry (Turso) ----------
 async function loadAccountsRegistry() {
@@ -98,11 +111,8 @@ async function saveAccountsRegistry(list) {
 }
 
 // ---------- KAM → sending account mapping (Turso) ----------
-// Separate from the group mapping above. The group mapping decides WHICH
-// WhatsApp group a message goes to; this decides WHICH connected WhatsApp
-// account sends it — based on who's logged into the dashboard, not on the
-// target group. So the same "CarryBee Issue Group || NN1" can be messaged
-// by Nahid's number one day and Solayman's the next, whoever is logged in.
+// Decides WHICH connected WhatsApp account sends, based on who's logged into
+// the dashboard (not on the target group).
 async function loadKamMapping() {
   try {
     const raw = await kvStore.get('kam-account-mapping');
@@ -120,15 +130,8 @@ function normalizeEmail(email) {
 }
 
 // ---------- group mapping (Turso) ----------
-// Group mapping used to live in a local groups-config.json file. On
-// Render's free tier, the filesystem is wiped every time the instance
-// spins down from inactivity and back up, so that mapping kept vanishing
-// silently. It's now stored in Turso (same as the WhatsApp session
-// creds) under a single key, so it actually persists.
-//
-// Each entry now also carries account_id — which connected WhatsApp
-// account should send to that group, since only the account that's
-// actually a member of a given WhatsApp group can post into it.
+// Stored in Turso (not local disk) so it survives Render restarts.
+// Each entry carries account_id — which connected account posts to that group.
 async function loadMapping() {
   try {
     const raw = await kvStore.get('group-mapping');
@@ -144,39 +147,21 @@ async function loadMapping() {
 }
 async function saveMapping(mapping) {
   await kvStore.set('group-mapping', JSON.stringify(mapping));
-  // Best-effort local copy too, purely as a debugging convenience — not relied on.
+  // Best-effort local copy, purely a debugging convenience — not relied on.
   try { fs.writeFileSync(MAPPING_FILE, JSON.stringify(mapping, null, 2)); } catch (e) {}
 }
 function normalizeName(name) {
   return (name || '')
-    .replace(/[\u00A0\u200B-\u200D\uFEFF]/g, ' ') // NBSP/zero-width chars from copy-pasted sheet cells -> normal space
+    .replace(/[\u00A0\u200B-\u200D\uFEFF]/g, ' ') // NBSP/zero-width chars from copy-pasted sheet cells
     .trim()
-    .replace(/\s+/g, ' ') // collapse any run of whitespace to a single space
+    .replace(/\s+/g, ' ')
     .toLowerCase();
 }
 
-// ---------- whatsapp connections (Baileys — no Chrome needed) ----------
-const kvStore = new TursoKVStore({
-  url: process.env.TURSO_DB_URL,
-  token: process.env.TURSO_DB_TOKEN
-});
-
 // ---------- outgoing message store (needed for Baileys retry requests) ----------
-// WhatsApp Multi-Device is built on the Signal protocol: it's normal and
-// frequent for a recipient's device to fail to decrypt a message on the
-// first delivery and silently ask the sender to resend it ("retry
-// receipt"). Baileys can only answer that request if we hand it back the
-// original message content via getMessage() in the socket config below —
-// without that, the retry just fails and the recipient is stuck showing
-// "Waiting for this message. This may take a while." forever, even though
-// the send itself succeeded (the dashboard's toast goes green either way).
-//
-// This used to be an in-memory Map, which is exactly what broke the OPS
-// sends: Render's free tier restarts/spins the process down on inactivity,
-// wiping the Map before a slow retry request could ever look up the
-// original text. It's now backed by Turso (same as the session creds),
-// so a restart between "sent" and "recipient asks for a retry" no longer
-// loses the message.
+// Recipients' devices sometimes ask the sender to resend a message ("retry
+// receipt"). Baileys can only answer if getMessage() returns the original
+// content. Backed by Turso so a restart between send and retry doesn't lose it.
 const OUTGOING_MSG_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 1 day
 const OUTGOING_MSG_PRUNE_INTERVAL_MS = 60 * 60 * 1000; // hourly
 
@@ -194,23 +179,89 @@ setInterval(() => {
     .catch(e => console.error('[server] failed to prune outgoing message cache:', e.message));
 }, OUTGOING_MSG_PRUNE_INTERVAL_MS);
 
+// ---------- WhatsApp version (cached) ----------
+// Passing the current WA Web version is what prevents the 405 "Connection
+// Failure" rejection that leaves the QR page stuck on "Waiting for QR code".
+let cachedVersion = null;
+let cachedVersionAt = 0;
+const VERSION_TTL_MS = 6 * 60 * 60 * 1000;
+
+async function getWaVersion() {
+  const now = Date.now();
+  if (cachedVersion && now - cachedVersionAt < VERSION_TTL_MS) return cachedVersion;
+  try {
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    cachedVersion = version;
+    cachedVersionAt = now;
+    console.log(`[server] WhatsApp Web version ${version.join('.')} (isLatest: ${isLatest})`);
+    return version;
+  } catch (e) {
+    console.error('[server] could not fetch latest WA version, using package default:', e.message);
+    return cachedVersion || undefined;
+  }
+}
+
+// ---------- whatsapp connections (Baileys — no Chrome needed) ----------
+function clearReconnectTimer(acc) {
+  if (acc && acc.reconnectTimer) {
+    clearTimeout(acc.reconnectTimer);
+    acc.reconnectTimer = null;
+  }
+}
+
+function scheduleReconnect(accountId, delayMs) {
+  const acc = accounts[accountId];
+  if (!acc) return; // account was removed
+  clearReconnectTimer(acc);
+  acc.reconnectTimer = setTimeout(() => {
+    acc.reconnectTimer = null;
+    if (!accounts[accountId]) return;
+    startSock(accountId, acc.label).catch(e => {
+      console.error(`[${accountId}] startSock failed:`, e && e.message);
+      acc.lastError = e && e.message;
+      scheduleReconnect(accountId, backoffFor(acc));
+    });
+  }, delayMs);
+}
+
+function backoffFor(acc) {
+  acc.retries = (acc.retries || 0) + 1;
+  return Math.min(RECONNECT_BASE_MS * Math.pow(2, acc.retries - 1), RECONNECT_MAX_MS);
+}
+
 async function startSock(accountId, label) {
   const prefix = keyPrefixFor(accountId);
-  const { state, saveCreds } = await useTursoAuthState(kvStore, prefix);
 
   const acc = accounts[accountId] || (accounts[accountId] = { id: accountId, label });
   acc.label = label || acc.label;
   acc.isReady = false;
   acc.latestQr = null;
+  clearReconnectTimer(acc);
+
+  // Tear down any previous socket for this account so two never run at once.
+  if (acc.sock) {
+    try { acc.sock.ev.removeAllListeners(); } catch (e) {}
+    try { acc.sock.end(undefined); } catch (e) {}
+    acc.sock = null;
+  }
+
+  console.log(`[${accountId}] loading auth state from Turso...`);
+  const { state, saveCreds } = await useTursoAuthState(kvStore, prefix);
+  console.log(`[${accountId}] auth state loaded (registered: ${!!state.creds.registered}). Starting socket...`);
+
+  const version = await getWaVersion();
+
+  // The account may have been removed while we were awaiting above.
+  if (!accounts[accountId]) return;
 
   const sock = makeWASocket({
+    version, // undefined falls back to the package default
+    browser: Browsers.macOS('Chrome'),
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false,
-    // See outgoing message store above — lets Baileys resend the real
-    // content when a recipient device requests a retry, instead of the
-    // message getting permanently stuck undecrypted on their end. Now
-    // reads from Turso so it survives a restart between send and retry.
+    // Lets Baileys resend real content when a recipient device requests a
+    // retry, instead of the message staying stuck undecrypted on their end.
     getMessage: async (key) => {
       try {
         return (await kvStore.getOutgoing(`${accountId}::${key.remoteJid}::${key.id}`)) || undefined;
@@ -225,10 +276,19 @@ async function startSock(accountId, label) {
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', (update) => {
+    // Ignore events from a socket that has already been replaced/removed.
+    if (acc.sock !== sock || !accounts[accountId]) return;
+
     const { connection, lastDisconnect, qr } = update;
 
+    if (connection === 'connecting') {
+      console.log(`[${accountId}] connecting...`);
+    }
+
     if (qr) {
-      qrcode.toDataURL(qr).then(dataUrl => { acc.latestQr = dataUrl; });
+      qrcode.toDataURL(qr)
+        .then(dataUrl => { if (acc.sock === sock) acc.latestQr = dataUrl; })
+        .catch(e => console.error(`[${accountId}] QR render failed:`, e.message));
       acc.isReady = false;
       console.log(`[${accountId}] New QR code generated. Visit /qr/${accountId} to scan it, or /pair/${accountId}?phone=YOURNUMBER for a pairing code instead.`);
     }
@@ -237,24 +297,41 @@ async function startSock(accountId, label) {
       acc.isReady = true;
       acc.latestQr = null;
       acc.userInfo = sock.user;
+      acc.lastStatus = null;
+      acc.lastError = null;
+      acc.retries = 0;
       console.log(`[${accountId}] WhatsApp connected as`, acc.userInfo && (acc.userInfo.name || acc.userInfo.id));
     }
 
     if (connection === 'close') {
       acc.isReady = false;
-      const statusCode = new Boom(lastDisconnect && lastDisconnect.error)?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      console.log(`[${accountId}] Connection closed. Status code:`, statusCode, loggedOut ? '(logged out — clearing stale session and generating a new QR/code)' : '(reconnecting...)');
-      if (loggedOut) {
-        // The stored session is dead and will never be accepted again —
-        // wipe just this account's keys so the next startSock() starts
-        // fresh and actually offers a new QR code, without touching any
-        // other account's session or the group mapping.
+      acc.latestQr = null;
+      const err = lastDisconnect && lastDisconnect.error;
+      const statusCode = err ? new Boom(err).output.statusCode : undefined;
+      acc.lastStatus = statusCode || null;
+      acc.lastError = (err && err.message) || null;
+      console.log(`[${accountId}] Connection closed. Status code:`, statusCode, '|', acc.lastError);
+
+      if (statusCode === DisconnectReason.loggedOut) {
+        // Stored session is dead. Wipe just this account's keys so the next
+        // start offers a fresh QR, without touching other accounts.
+        console.log(`[${accountId}] logged out — clearing stale session, a new QR will be generated.`);
+        acc.retries = 0;
         kvStore.clearAccountSession(prefix)
           .catch(e => console.error(`[${accountId}] failed to clear stale session:`, e.message))
-          .finally(() => startSock(accountId, acc.label));
+          .finally(() => scheduleReconnect(accountId, 2000));
+      } else if (statusCode === DisconnectReason.connectionReplaced) {
+        // Same session is live elsewhere (e.g. an old bridge deployment using
+        // the same Turso DB). Reconnecting would just start a tug-of-war.
+        console.log(`[${accountId}] connection replaced by another session — NOT reconnecting. Stop the other deployment, then restart this one.`);
+      } else if (statusCode === DisconnectReason.restartRequired) {
+        // Normal right after pairing succeeds.
+        acc.retries = 0;
+        scheduleReconnect(accountId, 500);
       } else {
-        startSock(accountId, acc.label);
+        const delay = backoffFor(acc);
+        console.log(`[${accountId}] reconnecting in ${Math.round(delay / 1000)}s (attempt ${acc.retries})...`);
+        scheduleReconnect(accountId, delay);
       }
     }
   });
@@ -264,15 +341,23 @@ async function initAccounts() {
   const list = await loadAccountsRegistry();
   await saveAccountsRegistry(list); // persist the default entry if it was just added
   for (const a of list) {
-    accounts[a.id] = { id: a.id, label: a.label, isReady: false, userInfo: null, latestQr: null };
+    accounts[a.id] = { id: a.id, label: a.label, isReady: false, userInfo: null, latestQr: null, retries: 0 };
   }
   // Sequential on purpose — avoids interleaved QR/log noise on boot.
   for (const a of list) {
-    await startSock(a.id, a.label);
+    try {
+      await startSock(a.id, a.label);
+    } catch (e) {
+      console.error(`[${a.id}] initial startSock failed:`, e && e.message);
+      if (accounts[a.id]) {
+        accounts[a.id].lastError = e && e.message;
+        scheduleReconnect(a.id, backoffFor(accounts[a.id]));
+      }
+    }
   }
 }
 
-initAccounts();
+initAccounts().catch(e => console.error('[server] initAccounts failed:', e));
 
 // ---------- express app ----------
 const app = express();
@@ -299,14 +384,14 @@ function requireAccount(req, res, next) {
   next();
 }
 
-// Status/admin page
+// Status page
 app.get('/', (req, res) => {
   const rows = Object.values(accounts).map(a => `
     <tr>
       <td>${a.label}</td>
       <td><code>${a.id}</code></td>
       <td><span class="badge ${a.isReady ? 'on' : 'off'}">${a.isReady ? 'Connected' : 'Not connected'}</span></td>
-      <td>${a.isReady && a.userInfo ? (a.userInfo.name || a.userInfo.id) : `<a href="/qr/${a.id}">/qr</a> · <a href="/pair/${a.id}">/pair</a>`}</td>
+      <td>${a.isReady && a.userInfo ? (a.userInfo.name || a.userInfo.id) : `<a href="/qr/${a.id}">/qr</a> · <a href="/pair/${a.id}">/pair</a>${a.lastStatus ? ` <small>(last status ${a.lastStatus})</small>` : ''}`}</td>
     </tr>
   `).join('');
   res.send(`
@@ -348,11 +433,20 @@ app.get('/qr/:accountId', requireAccount, (req, res) => {
     return res.send(`<p style="font-family:sans-serif">"${acc.label}" is already connected. <a href="/">Back to status</a></p>`);
   }
   if (!acc.latestQr) {
-    return res.send('<p style="font-family:sans-serif">Waiting for QR code to generate... refresh in a few seconds.</p>');
+    const diag = acc.lastStatus
+      ? `<p style="color:#D64545;font-size:13px;">Last disconnect status: <b>${acc.lastStatus}</b>${acc.lastError ? ' — ' + acc.lastError : ''}. Retrying automatically.</p>`
+      : '';
+    return res.send(`
+      <!DOCTYPE html><html><head><meta charset="UTF-8"><meta http-equiv="refresh" content="4"><title>Waiting for QR</title></head>
+      <body style="font-family:sans-serif">
+        <p>Waiting for QR code to generate... this page refreshes automatically.</p>
+        ${diag}
+      </body></html>
+    `);
   }
   res.send(`
     <!DOCTYPE html>
-    <html><head><meta charset="UTF-8"><title>Scan to connect — ${acc.label}</title>
+    <html><head><meta charset="UTF-8"><meta http-equiv="refresh" content="20"><title>Scan to connect — ${acc.label}</title>
     <style>body{font-family:sans-serif;text-align:center;margin-top:60px;background:#FFFDF7;}
     h1{font-family:sans-serif;color:#141414;}</style></head>
     <body>
@@ -403,6 +497,7 @@ app.get('/pair/:accountId', requireAccount, async (req, res) => {
     return res.send(pageWrap(`
       <h1>Not ready yet</h1>
       <p>The bridge is still starting up, or is already registered. Wait a few seconds and reload, or check <a href="/">the status page</a>.</p>
+      ${acc.lastStatus ? `<p style="color:#D64545;font-size:13px;">Last disconnect status: <b>${acc.lastStatus}</b>${acc.lastError ? ' — ' + acc.lastError : ''}</p>` : ''}
     `));
   }
 
@@ -446,16 +541,22 @@ app.post('/api/accounts', requireApiKey, async (req, res) => {
   const list = await loadAccountsRegistry();
   list.push({ id, label: label.trim() });
   await saveAccountsRegistry(list);
-  accounts[id] = { id, label: label.trim(), isReady: false, userInfo: null, latestQr: null };
+  accounts[id] = { id, label: label.trim(), isReady: false, userInfo: null, latestQr: null, retries: 0 };
   console.log(`[admin:${req.adminName}] added account "${label.trim()}" (${id})`);
-  await startSock(id, label.trim());
+  // Don't block the response on the socket handshake.
+  startSock(id, label.trim()).catch(e => {
+    console.error(`[${id}] startSock failed:`, e && e.message);
+    if (accounts[id]) {
+      accounts[id].lastError = e && e.message;
+      scheduleReconnect(id, backoffFor(accounts[id]));
+    }
+  });
   res.json({ ok: true, account: publicAccountInfo(accounts[id]), qr_url: `/qr/${id}`, pair_url: `/pair/${id}` });
 });
 
-// Remove a WhatsApp account (not the default one). Logs it out, wipes
-// only its own session keys, and leaves the group mapping as-is —
-// any mapping entries pointing at it will just fail with a clear error
-// on send until re-pointed at another account.
+// Remove a WhatsApp account (not the default one). Logs it out, wipes only
+// its own session keys, and leaves the group mapping as-is — mapping entries
+// pointing at it will fail with a clear error on send until re-pointed.
 app.delete('/api/accounts/:accountId', requireApiKey, requireAccount, async (req, res) => {
   const acc = req.account;
   if (acc.id === DEFAULT_ACCOUNT_ID) {
@@ -463,15 +564,33 @@ app.delete('/api/accounts/:accountId', requireApiKey, requireAccount, async (req
   }
   console.log(`[admin:${req.adminName}] removing account "${acc.label}" (${acc.id})`);
   try {
+    // Remove from memory FIRST so the close event from logout() can't
+    // resurrect the account via the reconnect logic.
+    delete accounts[acc.id];
+    clearReconnectTimer(acc);
     if (acc.sock) {
       try { await acc.sock.logout(); } catch (e) { /* best-effort */ }
+      try { acc.sock.ev.removeAllListeners(); } catch (e) {}
+      try { acc.sock.end(undefined); } catch (e) {}
     }
   } finally {
     await kvStore.clearAccountSession(keyPrefixFor(acc.id));
-    delete accounts[acc.id];
     const list = (await loadAccountsRegistry()).filter(a => a.id !== acc.id);
     await saveAccountsRegistry(list);
   }
+  res.json({ ok: true });
+});
+
+// Manually restart one account's connection (useful if it gets stuck)
+app.post('/api/accounts/:accountId/restart', requireApiKey, requireAccount, async (req, res) => {
+  const acc = req.account;
+  console.log(`[admin:${req.adminName}] manual restart of "${acc.label}" (${acc.id})`);
+  acc.retries = 0;
+  startSock(acc.id, acc.label).catch(e => {
+    console.error(`[${acc.id}] startSock failed:`, e && e.message);
+    acc.lastError = e && e.message;
+    scheduleReconnect(acc.id, backoffFor(acc));
+  });
   res.json({ ok: true });
 });
 
@@ -525,8 +644,6 @@ app.get('/api/kam-mapping', requireApiKey, async (req, res) => {
 });
 
 // Add or update a KAM mapping entry: { "email": "...", "account_id": "..." }
-// This is what makes each KAM's remarks go out from their own connected
-// WhatsApp number, instead of everyone sharing one account.
 app.post('/api/kam-mapping', requireApiKey, async (req, res) => {
   const { email, account_id } = req.body;
   if (!email || !account_id) {
@@ -550,8 +667,7 @@ app.delete('/api/kam-mapping/:email', requireApiKey, async (req, res) => {
 });
 
 // Main endpoint: dashboard calls this when a KAM saves a remark.
-// Routes to whichever WhatsApp account is mapped to that group.
-// body: { group_name: "CarryBee Issue Group || NN1", message: "...(fully formatted by the dashboard)...", kam_email: "nuruzzaman.nahid@carrybee.com" }
+// body: { group_name, message, kam_email? }
 app.post('/api/send-remark', requireApiKey, async (req, res) => {
   const { group_name, message, kam_email } = req.body;
   if (!group_name || !message) {
@@ -566,12 +682,8 @@ app.post('/api/send-remark', requireApiKey, async (req, res) => {
     });
   }
 
-  // Sending account: prefer whoever is logged in on the dashboard (KAM
-  // mapping) over the group's own default account_id. Falls back to the
-  // group's account_id — and then to the default account — for callers
-  // that don't send kam_email (e.g. old cached dashboard code, or the
-  // fixed CTG/OSD/ISD OPS buttons if those senders aren't individually
-  // mapped yet).
+  // Sending account: prefer the logged-in KAM's mapped account, then the
+  // group's own account_id, then the default account.
   let accountId = entry.account_id || DEFAULT_ACCOUNT_ID;
   let accountSource = 'group mapping';
   if (kam_email) {
@@ -612,6 +724,7 @@ app.get('/admin', (req, res) => {
   <head>
     <meta charset="UTF-8">
     <title>CarryBee Bridge Admin</title>
+    <link rel="icon" href="data:,">
     <style>
       body{font-family:'Plus Jakarta Sans',Arial,sans-serif;background:#FFFDF7;color:#1c1c1c;max-width:820px;margin:40px auto;padding:0 20px;}
       h1{font-family:'Space Grotesk',sans-serif;font-size:22px;}
@@ -740,8 +853,8 @@ app.get('/admin', (req, res) => {
           const body = document.getElementById('accountsBody');
           body.innerHTML = lastAccounts.map(a =>
             '<tr><td>' + a.label + '</td><td><code>' + a.id + '</code></td>' +
-            '<td><span class="badge ' + (a.ready ? 'on' : 'off') + '">' + (a.ready ? ('Connected' + (a.name ? ' as ' + a.name : '')) : 'Not connected') + '</span></td>' +
-            '<td>' + (a.ready ? '—' : ('<a href="/qr/' + a.id + '" target="_blank">QR</a> / <a href="/pair/' + a.id + '" target="_blank">code</a>')) + '</td>' +
+            '<td><span class="badge ' + (a.ready ? 'on' : 'off') + '">' + (a.ready ? ('Connected' + (a.name ? ' as ' + a.name : '')) : ('Not connected' + (a.last_status ? ' (' + a.last_status + ')' : ''))) + '</span></td>' +
+            '<td>' + (a.ready ? '—' : ('<a href="/qr/' + a.id + '" target="_blank">QR</a> / <a href="/pair/' + a.id + '" target="_blank">code</a> / <a href="#" onclick="restartAccount(\\'' + a.id + '\\');return false;">restart</a>')) + '</td>' +
             '<td>' + (a.deletable ? '<button class="danger" onclick="removeAccount(\\'' + a.id + '\\')">Remove</button>' : '') + '</td></tr>'
           ).join('');
           document.getElementById('accountsTable').style.display = lastAccounts.length ? 'table' : 'none';
@@ -750,6 +863,16 @@ app.get('/admin', (req, res) => {
           const kamSelect = document.getElementById('kamAccountSelect');
           kamSelect.innerHTML = lastAccounts.map(a => '<option value="' + a.id + '">' + a.label + (a.ready ? '' : ' (not connected)') + '</option>').join('');
           showMsg('accountsMsg', 'Loaded ' + lastAccounts.length + ' account(s).', true);
+        } catch (e) {
+          showMsg('accountsMsg', e.message, false);
+        }
+      }
+
+      async function restartAccount(id) {
+        if (!key()) return;
+        try {
+          await api('/api/accounts/' + encodeURIComponent(id) + '/restart', { method: 'POST' });
+          showMsg('accountsMsg', 'Restarting "' + id + '"... open its QR page in a few seconds.', true);
         } catch (e) {
           showMsg('accountsMsg', e.message, false);
         }
