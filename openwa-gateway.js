@@ -60,81 +60,98 @@ function extractApiErrorMessage(err) {
 
 class OpenWAGateway {
   constructor(options = {}) {
-    this.baseUrl = String(options.baseUrl || process.env.OPENWA_BASE_URL || DEFAULT_BASE_URL)
-      .trim()
-      .replace(/\/+$/, '');
-    this.explicitApiKey = options.apiKey !== undefined ? options.apiKey : undefined;
+    this.explicitBaseUrl = options.baseUrl !== undefined ? String(options.baseUrl).trim().replace(/\/+$/, '') : '';
+    this.explicitApiKey = options.apiKey !== undefined ? String(options.apiKey).trim() : '';
     this.keyFile = options.keyFile || process.env.OPENWA_KEY_FILE || DEFAULT_KEY_FILE;
     this.timeoutMs = options.timeoutMs ?? Number(process.env.OPENWA_TIMEOUT_MS || 30000);
     this.fetchImpl = options.fetch;
+    this.configLoader = options.configLoader || null; // async () => ({ base_url, api_key }) | null
     this._cachedClient = null;
+    this._cachedBaseUrl = null;
     this._cachedApiKey = null;
   }
 
-  resolveApiKey() {
-    if (this.explicitApiKey && String(this.explicitApiKey).trim()) {
-      return String(this.explicitApiKey).trim();
+  async resolveConnectionConfig() {
+    let saved = null;
+    if (this.configLoader) {
+      try { saved = await this.configLoader(); } catch (_) {}
     }
-    if (process.env.OPENWA_API_KEY && process.env.OPENWA_API_KEY.trim()) {
-      return process.env.OPENWA_API_KEY.trim();
-    }
-    if (process.env.API_MASTER_KEY && process.env.API_MASTER_KEY.trim()) {
-      return process.env.API_MASTER_KEY.trim();
-    }
-    if (this.keyFile) {
+
+    const baseUrl = (
+      this.explicitBaseUrl ||
+      (process.env.OPENWA_BASE_URL && process.env.OPENWA_BASE_URL.trim()) ||
+      (saved && saved.base_url && String(saved.base_url).trim()) ||
+      DEFAULT_BASE_URL
+    ).replace(/\/+$/, '');
+
+    let apiKey = (
+      this.explicitApiKey ||
+      (process.env.OPENWA_API_KEY && process.env.OPENWA_API_KEY.trim()) ||
+      (saved && saved.api_key && String(saved.api_key).trim()) ||
+      (process.env.API_MASTER_KEY && process.env.API_MASTER_KEY.trim()) ||
+      ''
+    );
+
+    if (!apiKey && this.keyFile) {
       try {
         if (fs.existsSync(this.keyFile)) {
           const fromFile = fs.readFileSync(this.keyFile, 'utf8').trim();
-          if (fromFile) return fromFile;
+          if (fromFile) apiKey = fromFile;
         }
-      } catch (e) {
-        // Ignore unreadable bootstrap key file; caller gets a clear error below.
-      }
+      } catch (_) {}
     }
-    return '';
+
+    const hasExplicitGateway = Boolean(
+      this.explicitBaseUrl ||
+      (process.env.OPENWA_BASE_URL && process.env.OPENWA_BASE_URL.trim()) ||
+      (saved && saved.base_url && String(saved.base_url).trim())
+    );
+
+    return { baseUrl, apiKey, hasExplicitGateway };
   }
 
-  isMissingBundledOpenWA() {
-    const isLocalDefault = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(this.baseUrl);
-    return isLocalDefault && !process.env.OPENWA_BASE_URL && !fs.existsSync('/app/dist/main');
+  isMissingBundledOpenWA(baseUrl, hasExplicitGateway) {
+    const isLocalDefault = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(baseUrl);
+    return isLocalDefault && !hasExplicitGateway && !fs.existsSync('/app/dist/main');
   }
 
-  getClient() {
-    const apiKey = this.resolveApiKey();
+  async getClient() {
+    const { baseUrl, apiKey, hasExplicitGateway } = await this.resolveConnectionConfig();
     if (!apiKey) {
-      const msg = this.isMissingBundledOpenWA()
-        ? 'OpenWA is not running because this service was deployed in Node.js mode instead of Docker mode. On Render, create a new Web Service with Language = Docker (an existing Node service ignores Dockerfile), or set OPENWA_BASE_URL and OPENWA_API_KEY.'
-        : `OpenWA Gateway is still initializing first-boot credentials (wait ~20s and click Refresh accounts, or set OPENWA_API_KEY).`;
+      const msg = this.isMissingBundledOpenWA(baseUrl, hasExplicitGateway)
+        ? 'No OpenWA Gateway connected yet. Paste your OpenWA Gateway URL & API Key in "/admin" (Section 0) — or deploy Dockerfile on a Docker host.'
+        : 'OpenWA Gateway is still initializing first-boot credentials (wait ~20s and click Refresh accounts, or set OPENWA_API_KEY).';
       const err = new Error(msg);
       err.code = 'OPENWA_KEY_MISSING';
       err.status = 503;
       throw err;
     }
-    if (!this._cachedClient || this._cachedApiKey !== apiKey) {
+
+    if (!this._cachedClient || this._cachedApiKey !== apiKey || this._cachedBaseUrl !== baseUrl) {
       this._cachedClient = new OpenWAClient({
-        baseUrl: this.baseUrl,
+        baseUrl,
         apiKey,
         timeoutMs: this.timeoutMs,
         ...(this.fetchImpl ? { fetch: this.fetchImpl } : {})
       });
+      this._cachedBaseUrl = baseUrl;
       this._cachedApiKey = apiKey;
     }
-    return this._cachedClient;
+    return { client: this._cachedClient, baseUrl, hasExplicitGateway };
   }
 
-  _wrapError(err) {
+  _wrapError(err, baseUrl = DEFAULT_BASE_URL, hasExplicitGateway = false) {
     if (!err) return new Error('Unknown OpenWA gateway error');
     if (err instanceof OpenWAAuthError) {
-      // Clear cached client so if `.api-key` rotated on disk, next request picks up the new key.
       this._cachedClient = null;
       this._cachedApiKey = null;
-      const wrapped = new Error(`OpenWA authentication failed (401). Check OPENWA_API_KEY.`);
+      const wrapped = new Error(`OpenWA authentication failed (401) at ${baseUrl}. Check your OpenWA API key in /admin.`);
       wrapped.status = 502;
       wrapped.cause = err;
       return wrapped;
     }
     if (err instanceof OpenWATimeoutError) {
-      const wrapped = new Error(`OpenWA gateway timed out after ${this.timeoutMs}ms (${this.baseUrl}).`);
+      const wrapped = new Error(`OpenWA gateway timed out after ${this.timeoutMs}ms (${baseUrl}).`);
       wrapped.status = 504;
       wrapped.cause = err;
       return wrapped;
@@ -149,12 +166,11 @@ class OpenWAGateway {
     if (err.code === 'OPENWA_KEY_MISSING') {
       return err;
     }
-    // Network / connection refused (e.g. OpenWA still booting in container or not running)
     const msg = err.message || String(err);
-    const hint = this.isMissingBundledOpenWA()
-      ? 'This service is running in Node.js mode instead of Docker mode — redeploy using Language = Docker so Dockerfile starts OpenWA.'
-      : 'OpenWA Gateway is starting up inside Docker (usually takes ~20–30s on cold boot) — click Refresh accounts in a moment.';
-    const wrapped = new Error(`Cannot reach OpenWA Gateway at ${this.baseUrl} (${msg}). ${hint}`);
+    const hint = this.isMissingBundledOpenWA(baseUrl, hasExplicitGateway)
+      ? 'Paste your OpenWA Gateway URL & API Key in /admin (Section 0).'
+      : 'Make sure OpenWA is running and reachable from this server.';
+    const wrapped = new Error(`Cannot reach OpenWA Gateway at ${baseUrl} (${msg}). ${hint}`);
     wrapped.status = 503;
     wrapped.code = 'OPENWA_UNREACHABLE';
     wrapped.cause = err;
@@ -162,51 +178,55 @@ class OpenWAGateway {
   }
 
   async checkHealth() {
+    const { baseUrl, hasExplicitGateway } = await this.resolveConnectionConfig();
     try {
-      const client = this.getClient();
+      const { client } = await this.getClient();
       const health = await client.health.check();
       return {
         reachable: true,
         ready: true,
-        base_url: this.baseUrl,
+        base_url: baseUrl,
         version: (health && health.version) || null
       };
     } catch (err) {
-      // Even before `.api-key` exists on very first boot, check unauthenticated liveness if possible.
-      try {
-        const fetchFn = this.fetchImpl || globalThis.fetch;
-        const res = await fetchFn(`${this.baseUrl}/api/health/live`, {
-          signal: AbortSignal.timeout(3000)
-        });
-        if (res.ok) {
-          return {
-            reachable: true,
-            ready: false,
-            base_url: this.baseUrl,
-            error: extractApiErrorMessage(err)
-          };
-        }
-      } catch (_) {}
-      const wrapped = this._wrapError(err);
+      if (!this.isMissingBundledOpenWA(baseUrl, hasExplicitGateway)) {
+        try {
+          const fetchFn = this.fetchImpl || globalThis.fetch;
+          const res = await fetchFn(`${baseUrl}/api/health/live`, {
+            signal: AbortSignal.timeout(3000)
+          });
+          if (res.ok) {
+            return {
+              reachable: true,
+              ready: false,
+              base_url: baseUrl,
+              error: extractApiErrorMessage(err)
+            };
+          }
+        } catch (_) {}
+      }
+      const wrapped = this._wrapError(err, baseUrl, hasExplicitGateway);
       return {
         reachable: false,
         ready: false,
-        base_url: this.baseUrl,
+        base_url: baseUrl,
         error: wrapped.message
       };
     }
   }
 
   async listSessions() {
+    const { baseUrl, hasExplicitGateway } = await this.resolveConnectionConfig();
     try {
-      return await this.getClient().sessions.list({ limit: 1000 });
+      const { client } = await this.getClient();
+      return await client.sessions.list({ limit: 1000 });
     } catch (err) {
-      throw this._wrapError(err);
+      throw this._wrapError(err, baseUrl, hasExplicitGateway);
     }
   }
 
   async findSession(account, sessionsList = null) {
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     const sessionName = toSessionName(account.id);
 
     if (Array.isArray(sessionsList)) {
@@ -222,10 +242,8 @@ class OpenWAGateway {
         return await client.sessions.get(account.openwa_session_id);
       } catch (err) {
         if (!(err instanceof OpenWANotFoundError)) {
-          throw this._wrapError(err);
+          throw this._wrapError(err, baseUrl, hasExplicitGateway);
         }
-        // Stored session UUID belongs to a previous OpenWA instance (e.g. migrated from Render to VPS);
-        // fall through to look up or re-create by deterministic session name.
       }
     }
 
@@ -233,7 +251,7 @@ class OpenWAGateway {
       const matches = await client.sessions.list({ name: sessionName, limit: 10 });
       return matches.find(s => s.name === sessionName) || null;
     } catch (err) {
-      throw this._wrapError(err);
+      throw this._wrapError(err, baseUrl, hasExplicitGateway);
     }
   }
 
@@ -243,20 +261,19 @@ class OpenWAGateway {
     if (['ready', 'qr_ready', 'initializing', 'authenticating'].includes(session.status)) {
       return session;
     }
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     try {
       return await client.sessions.start(session.id);
     } catch (err) {
       if (err instanceof OpenWAConflictError) {
-        // Another request started the session concurrently — read fresh state.
         return await client.sessions.get(session.id);
       }
-      throw this._wrapError(err);
+      throw this._wrapError(err, baseUrl, hasExplicitGateway);
     }
   }
 
   async ensureSession(account, { autoStart = false, sessionsList = null } = {}) {
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     const sessionName = toSessionName(account.id);
 
     let session = await this.findSession(account, sessionsList);
@@ -272,7 +289,7 @@ class OpenWAGateway {
           session = matches.find(s => s.name === sessionName) || null;
           if (session) sessionIdChanged = session.id !== account.openwa_session_id;
         }
-        if (!session) throw this._wrapError(err);
+        if (!session) throw this._wrapError(err, baseUrl, hasExplicitGateway);
       }
     } else if (account.openwa_session_id !== session.id) {
       sessionIdChanged = true;
@@ -286,7 +303,7 @@ class OpenWAGateway {
   }
 
   async restartSession(account) {
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     const { session, sessionIdChanged } = await this.ensureSession(account, { autoStart: false });
 
     if (session.engineLoaded || ['ready', 'qr_ready', 'initializing', 'authenticating'].includes(session.status)) {
@@ -296,7 +313,7 @@ class OpenWAGateway {
         if (err instanceof OpenWAApiError && err.status === 502) {
           try { await client.sessions.forceKill(session.id); } catch (_) {}
         } else if (!(err instanceof OpenWAApiError && (err.status === 400 || err.status === 409))) {
-          throw this._wrapError(err);
+          throw this._wrapError(err, baseUrl, hasExplicitGateway);
         }
       }
     }
@@ -305,12 +322,12 @@ class OpenWAGateway {
       const started = await client.sessions.start(session.id);
       return { session: started, sessionIdChanged };
     } catch (err) {
-      throw this._wrapError(err);
+      throw this._wrapError(err, baseUrl, hasExplicitGateway);
     }
   }
 
   async removeSession(account) {
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     const session = await this.findSession(account);
     if (!session) return;
 
@@ -328,13 +345,13 @@ class OpenWAGateway {
       await client.sessions.delete(session.id);
     } catch (err) {
       if (!(err instanceof OpenWANotFoundError)) {
-        throw this._wrapError(err);
+        throw this._wrapError(err, baseUrl, hasExplicitGateway);
       }
     }
   }
 
   async getQrForAccount(account) {
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     const { session, sessionIdChanged } = await this.ensureSession(account, { autoStart: true });
 
     if (session.status === 'ready') {
@@ -358,7 +375,6 @@ class OpenWAGateway {
         sessionIdChanged
       };
     } catch (err) {
-      // OpenWA returns 400 or 409 while Chromium is still warming up before the first QR arrives.
       if (err instanceof OpenWAApiError && (err.status === 400 || err.status === 409)) {
         let fresh = session;
         try { fresh = await client.sessions.get(session.id); } catch (_) {}
@@ -369,12 +385,12 @@ class OpenWAGateway {
           sessionIdChanged
         };
       }
-      throw this._wrapError(err);
+      throw this._wrapError(err, baseUrl, hasExplicitGateway);
     }
   }
 
   async requestPairingCode(account, phoneNumber) {
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     const { session, sessionIdChanged } = await this.ensureSession(account, { autoStart: true });
 
     if (session.status === 'ready') {
@@ -395,12 +411,12 @@ class OpenWAGateway {
         sessionIdChanged
       };
     } catch (err) {
-      throw this._wrapError(err);
+      throw this._wrapError(err, baseUrl, hasExplicitGateway);
     }
   }
 
   async listGroupsForAccount(account) {
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     const { session, sessionIdChanged } = await this.ensureSession(account, { autoStart: false });
 
     if (session.status !== 'ready') {
@@ -429,12 +445,12 @@ class OpenWAGateway {
         notReady.status = 503;
         throw notReady;
       }
-      throw this._wrapError(err);
+      throw this._wrapError(err, baseUrl, hasExplicitGateway);
     }
   }
 
   async sendGroupText(account, groupId, text, idempotencyKey) {
-    const client = this.getClient();
+    const { client, baseUrl, hasExplicitGateway } = await this.getClient();
     const { session, sessionIdChanged } = await this.ensureSession(account, { autoStart: false });
 
     if (session.status !== 'ready') {
@@ -464,7 +480,7 @@ class OpenWAGateway {
         notReady.status = 503;
         throw notReady;
       }
-      throw this._wrapError(err);
+      throw this._wrapError(err, baseUrl, hasExplicitGateway);
     }
   }
 

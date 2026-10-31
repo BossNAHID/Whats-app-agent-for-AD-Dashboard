@@ -12,7 +12,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-const TursoKVStore = require('./turso-store');
+const { createKVStore, SupabaseKVStore } = require('./supabase-store');
 const { OpenWAGateway } = require('./openwa-gateway');
 
 const DEFAULT_ACCOUNT_ID = 'default';
@@ -81,15 +81,39 @@ function createApp(options = {}) {
   );
   const mappingFile = options.mappingFile || path.join(__dirname, 'groups-config.json');
 
-  const kvStore = options.kvStore || new TursoKVStore({
-    url: process.env.TURSO_DB_URL,
-    token: process.env.TURSO_DB_TOKEN
-  });
+  const kvStore = options.kvStore || createKVStore(options.storeOptions);
+
+  const storageBackend = kvStore instanceof SupabaseKVStore
+    ? 'supabase'
+    : (kvStore && kvStore.hasTurso ? 'turso' : 'local');
+
+  let gatewayConfigCache = { value: null, expiresAt: 0 };
+
+  async function loadGatewayConfig({ bypassCache = false } = {}) {
+    if (!bypassCache && Date.now() < gatewayConfigCache.expiresAt) {
+      return gatewayConfigCache.value;
+    }
+    try {
+      const raw = await kvStore.get('openwa-gateway-config');
+      const parsed = raw ? JSON.parse(raw) : null;
+      gatewayConfigCache = { value: parsed, expiresAt: Date.now() + 5000 };
+      return parsed;
+    } catch (e) {
+      console.error('[server] failed to load gateway config:', e.message);
+      return null;
+    }
+  }
+
+  async function saveGatewayConfig(config) {
+    await kvStore.set('openwa-gateway-config', JSON.stringify(config));
+    gatewayConfigCache = { value: config, expiresAt: Date.now() + 5000 };
+  }
 
   const gateway = options.gateway || new OpenWAGateway({
     baseUrl: process.env.OPENWA_BASE_URL,
     apiKey: process.env.OPENWA_API_KEY,
-    keyFile: process.env.OPENWA_KEY_FILE
+    keyFile: process.env.OPENWA_KEY_FILE,
+    configLoader: () => loadGatewayConfig()
   });
 
   // ---------- accounts registry (Turso / local KV fallback) ----------
@@ -234,13 +258,22 @@ function createApp(options = {}) {
     const key = req.header('x-api-key');
     if (key === apiKey) {
       req.adminName = 'default';
+      req.isMasterAdmin = true;
       return next();
     }
     if (key && adminKeys.has(key)) {
       req.adminName = adminKeys.get(key);
+      req.isMasterAdmin = false;
       return next();
     }
     return res.status(401).json({ error: 'Invalid or missing x-api-key header' });
+  }
+
+  function maskSecret(secret) {
+    const s = String(secret || '').trim();
+    if (!s) return null;
+    if (s.length <= 12) return '••••••••';
+    return `${s.slice(0, 9)}••••${s.slice(-4)}`;
   }
 
   async function requireAccount(req, res, next) {
@@ -258,12 +291,121 @@ function createApp(options = {}) {
     }
   }
 
-  // Health probe for Render / Docker Compose
+  // When running inside the all-in-one Docker image (/app/dist/main present),
+  // expose OpenWA's authenticated SDK API under `/openwa/*` (protected by OpenWA's 71-char API_MASTER_KEY)
+  // so single-port Docker hosts (like Render Free or VPS :3000) can seamlessly act as the remote
+  // OpenWA engine for the permanent Vercel + Supabase front-end with zero route collisions.
+  const localOpenwaTarget = options.localOpenwaProxyTarget
+    || (fs.existsSync('/app/dist/main')
+      ? `http://127.0.0.1:${process.env.OPENWA_INTERNAL_PORT || 2785}`
+      : null);
+
+  if (localOpenwaTarget) {
+    app.use('/openwa', async (req, res) => {
+      try {
+        const subPath = req.originalUrl.replace(/^\/openwa(?=\/|$)/, '') || '/';
+        const targetUrl = `${localOpenwaTarget.replace(/\/+$/, '')}${subPath}`;
+        const fwdHeaders = {};
+        for (const h of ['x-api-key', 'authorization', 'content-type', 'accept', 'idempotency-key']) {
+          const val = req.header(h);
+          if (val !== undefined) fwdHeaders[h] = val;
+        }
+        const hasBody = !['GET', 'HEAD'].includes(req.method.toUpperCase())
+          && req.body !== undefined
+          && Object.keys(req.body || {}).length > 0;
+        const upstream = await fetch(targetUrl, {
+          method: req.method,
+          headers: fwdHeaders,
+          body: hasBody ? JSON.stringify(req.body) : undefined,
+          signal: AbortSignal.timeout(30000)
+        });
+        res.status(upstream.status);
+        const ct = upstream.headers.get('content-type');
+        if (ct) res.setHeader('Content-Type', ct);
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        return res.send(buf);
+      } catch (err) {
+        return res.status(502).json({ error: `Local OpenWA upstream unavailable: ${err.message}` });
+      }
+    });
+  }
+
+  // Health probe for Vercel / Render / Docker Compose
   app.get('/api/health', async (req, res) => {
     const openwa = await gateway.checkHealth();
     res.json({
       ok: true,
       bridge: 'ready',
+      storage: storageBackend,
+      openwa
+    });
+  });
+
+  // Dynamic OpenWA Gateway connection config (stored in Supabase / KV)
+  app.get('/api/gateway-config', requireApiKey, async (req, res) => {
+    if (!req.isMasterAdmin) {
+      return res.status(403).json({ error: 'Master API_KEY required to inspect gateway configuration' });
+    }
+    const saved = await loadGatewayConfig({ bypassCache: true });
+    const envBaseUrl = process.env.OPENWA_BASE_URL ? process.env.OPENWA_BASE_URL.trim() : '';
+    const envApiKey = process.env.OPENWA_API_KEY ? process.env.OPENWA_API_KEY.trim() : '';
+    const openwa = await gateway.checkHealth();
+
+    res.json({
+      storage_backend: storageBackend,
+      base_url: envBaseUrl || (saved && saved.base_url) || '',
+      has_api_key: Boolean(envApiKey || (saved && saved.api_key)),
+      masked_api_key: maskSecret(envApiKey || (saved && saved.api_key)),
+      env_override: Boolean(envBaseUrl),
+      openwa
+    });
+  });
+
+  app.post('/api/gateway-config', requireApiKey, async (req, res) => {
+    if (!req.isMasterAdmin) {
+      return res.status(403).json({ error: 'Master API_KEY required to update gateway configuration' });
+    }
+    const rawUrl = String((req.body && req.body.base_url) || '').trim();
+    const rawKey = String((req.body && req.body.api_key) || '').trim();
+
+    if (!rawUrl) {
+      return res.status(400).json({ error: 'base_url is required (e.g. https://your-openwa.onrender.com or http://VPS_IP:2785)' });
+    }
+
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(rawUrl);
+    } catch (_) {
+      return res.status(400).json({ error: 'Invalid URL. Include http:// or https:// (e.g. https://your-openwa.onrender.com)' });
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      return res.status(400).json({ error: 'URL must start with http:// or https://' });
+    }
+    const hostLower = parsedUrl.hostname.toLowerCase();
+    if (hostLower === '169.254.169.254' || hostLower === 'metadata.google.internal') {
+      return res.status(400).json({ error: 'Disallowed gateway hostname' });
+    }
+
+    const cleanBaseUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/+$/, '')}`;
+    const existing = (await loadGatewayConfig({ bypassCache: true })) || {};
+    const finalApiKey = rawKey || existing.api_key || '';
+
+    if (!finalApiKey) {
+      return res.status(400).json({ error: 'api_key is required when connecting OpenWA for the first time' });
+    }
+
+    await saveGatewayConfig({
+      base_url: cleanBaseUrl,
+      api_key: finalApiKey,
+      updated_at: new Date().toISOString()
+    });
+
+    const openwa = await gateway.checkHealth();
+    res.json({
+      ok: true,
+      storage_backend: storageBackend,
+      base_url: cleanBaseUrl,
+      masked_api_key: maskSecret(finalApiKey),
       openwa
     });
   });
@@ -731,11 +873,27 @@ function createApp(options = {}) {
       </style>
     </head>
     <body>
-      <h1>🐝 CarryBee Bridge Admin <small style="font-size:13px;color:#7a7566;font-weight:500;">(OpenWA Engine)</small></h1>
+      <h1>🐝 CarryBee Bridge Admin <small style="font-size:13px;color:#7a7566;font-weight:500;">(OpenWA + ${escapeHtml(storageBackend.toUpperCase())})</small></h1>
 
       <label>Bridge API Key</label>
       <input type="password" id="apiKey" placeholder="paste your API_KEY here" />
       <p style="font-size:11px;color:#888;">This stays only in your browser tab — it's sent with each button click below, nothing is saved anywhere.</p>
+
+      <h2>0. OpenWA Gateway Connection <small style="font-size:12px;color:#7a7566;font-weight:400;">(for Vercel / External Docker)</small></h2>
+      <p style="font-size:11px;color:#666;margin-top:-6px;">When CarryBee Bridge runs on <strong>Vercel + Supabase</strong>, paste your OpenWA Docker URL (Render Docker today, or XeonBD VPS IP in a few days) &amp; OpenWA API Key below. When running all-in-one inside Docker, this connects automatically.</p>
+      <div class="row">
+        <div>
+          <label>OpenWA Gateway URL</label>
+          <input type="text" id="gwBaseUrl" placeholder="https://your-openwa-docker.onrender.com  or  http://VPS_IP:2785" />
+        </div>
+        <div>
+          <label>OpenWA API Key <span id="gwKeyHint" style="color:#2E8B57;font-weight:400;"></span></label>
+          <input type="password" id="gwApiKey" placeholder="owa_k1_..." />
+        </div>
+      </div>
+      <button onclick="saveGatewayConfig()">Save &amp; Test OpenWA Connection</button>
+      <button class="secondary" onclick="loadGatewayConfig()" style="margin-left:6px;">Check Current Gateway</button>
+      <div id="gwMsg"></div>
 
       <h2>1. WhatsApp accounts</h2>
       <button onclick="loadAccounts()">Refresh accounts</button>
@@ -834,6 +992,49 @@ function createApp(options = {}) {
 
         let lastAccounts = [];
         let lastGroups = [];
+
+        async function loadGatewayConfig() {
+          if (!key()) { showMsg('gwMsg', 'Enter your Bridge API key above first.', false); return; }
+          showMsg('gwMsg', 'Checking OpenWA Gateway status...', true);
+          try {
+            const data = await api('/api/gateway-config');
+            if (data.base_url) document.getElementById('gwBaseUrl').value = data.base_url;
+            document.getElementById('gwKeyHint').textContent = data.masked_api_key ? ('(saved: ' + data.masked_api_key + ')') : '';
+            const gw = data.openwa || {};
+            if (gw.ready) {
+              showMsg('gwMsg', 'Connected to OpenWA Gateway at <code>' + esc(gw.base_url) + '</code>' + (gw.version ? ' (v' + esc(gw.version) + ')' : '') + ' · Storage: <strong>' + esc(data.storage_backend) + '</strong>.', true);
+            } else {
+              showMsg('gwMsg', 'Storage: <strong>' + esc(data.storage_backend) + '</strong> · OpenWA not ready yet: ' + esc(gw.error || 'Not configured'), false);
+            }
+          } catch (e) {
+            showMsg('gwMsg', esc(e.message), false);
+          }
+        }
+
+        async function saveGatewayConfig() {
+          if (!key()) { showMsg('gwMsg', 'Enter your Bridge API key above first.', false); return; }
+          const base_url = document.getElementById('gwBaseUrl').value.trim();
+          const api_key = document.getElementById('gwApiKey').value.trim();
+          if (!base_url) { showMsg('gwMsg', 'Enter your OpenWA Gateway URL first.', false); return; }
+          showMsg('gwMsg', 'Saving to Supabase & testing OpenWA connection...', true);
+          try {
+            const data = await api('/api/gateway-config', {
+              method: 'POST',
+              body: JSON.stringify({ base_url, api_key })
+            });
+            document.getElementById('gwApiKey').value = '';
+            document.getElementById('gwKeyHint').textContent = data.masked_api_key ? ('(saved: ' + data.masked_api_key + ')') : '';
+            const gw = data.openwa || {};
+            if (gw.ready) {
+              showMsg('gwMsg', 'Saved & Connected! OpenWA is live at <code>' + esc(gw.base_url) + '</code>' + (gw.version ? ' (v' + esc(gw.version) + ')' : '') + '. Refreshing accounts...', true);
+              loadAccounts();
+            } else {
+              showMsg('gwMsg', 'Saved in ' + esc(data.storage_backend) + ', but OpenWA returned: ' + esc(gw.error || 'Still warming up'), false);
+            }
+          } catch (e) {
+            showMsg('gwMsg', esc(e.message), false);
+          }
+        }
 
         async function loadAccounts() {
           if (!key()) { showMsg('accountsMsg', 'Enter your API key first.', false); return; }
@@ -1022,23 +1223,45 @@ function createApp(options = {}) {
   });
 
   app.syncAccountsOnBoot = async function syncAccountsOnBoot({ maxAttempts = 10 } = {}) {
+    // If running inside Docker with a known public URL (e.g. Render Docker or VPS) and shared Supabase KV,
+    // auto-register this OpenWA Gateway URL + API key so the Vercel front-end links automatically.
+    const publicGatewayUrl = (process.env.PUBLIC_GATEWAY_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
+    const localOpenwaKey = (process.env.OPENWA_API_KEY || '').trim();
+    if (publicGatewayUrl && localOpenwaKey && fs.existsSync('/app/dist/main')) {
+      const gatewayEndpoint = publicGatewayUrl.endsWith('/openwa')
+        ? publicGatewayUrl
+        : `${publicGatewayUrl}/openwa`;
+      try {
+        await saveGatewayConfig({
+          base_url: gatewayEndpoint,
+          api_key: localOpenwaKey,
+          updated_at: new Date().toISOString()
+        });
+        console.log(`[server] Auto-registered OpenWA Gateway (${gatewayEndpoint}) in ${storageBackend} for Vercel.`);
+      } catch (e) {
+        console.warn('[server] Could not auto-register gateway URL:', e.message);
+      }
+    }
+
+    let lastBaseUrl = 'http://127.0.0.1:2785';
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       const health = await gateway.checkHealth();
+      if (health.base_url) lastBaseUrl = health.base_url;
       if (health.ready) {
         const { accounts } = await getAccountsWithStatus({
           autoCreateMissing: true,
           autoStartCreated: true
         });
-        console.log(`[server] OpenWA Gateway connected (${gateway.baseUrl}) — synced ${accounts.length} CarryBee account(s).`);
+        console.log(`[server] OpenWA Gateway connected (${lastBaseUrl}) — synced ${accounts.length} CarryBee account(s).`);
         return;
       }
       const delayMs = Math.min(2000 * attempt, 10000);
       if (attempt === 1 || attempt === maxAttempts) {
-        console.log(`[server] Waiting for OpenWA Gateway (${gateway.baseUrl}) — attempt ${attempt}/${maxAttempts}...`);
+        console.log(`[server] Waiting for OpenWA Gateway (${lastBaseUrl}) — attempt ${attempt}/${maxAttempts}...`);
       }
       await new Promise(r => setTimeout(r, delayMs));
     }
-    console.warn(`[server] OpenWA Gateway not ready yet at ${gateway.baseUrl}; accounts will sync automatically on the next request.`);
+    console.warn(`[server] OpenWA Gateway not ready yet at ${lastBaseUrl}; accounts will sync automatically on the next request.`);
   };
 
   return app;

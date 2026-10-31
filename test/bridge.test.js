@@ -7,6 +7,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const TursoKVStore = require('../turso-store');
+const { SupabaseKVStore, createKVStore } = require('../supabase-store');
 const { OpenWAGateway, toSessionName } = require('../openwa-gateway');
 const { createApp } = require('../server');
 
@@ -481,5 +482,154 @@ test('Bridge stays up and serves status/admin cleanly while OpenWA is still warm
   } finally {
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('SupabaseKVStore speaks PostgREST protocol (get, upsert, delete) and createKVStore prioritizes Supabase', async () => {
+  const tableRows = new Map();
+  let sawBearerHeader = false;
+
+  const supabaseMock = await listenServer(async (req, res) => {
+    const parsed = new URL(req.url, 'http://127.0.0.1');
+    if (req.headers['authorization'] && req.headers['authorization'].startsWith('Bearer eyJ')) {
+      sawBearerHeader = true;
+    }
+
+    if (req.method === 'GET' && parsed.pathname === '/rest/v1/carrybee_kv') {
+      const keyFilter = parsed.searchParams.get('key_name') || '';
+      const key = keyFilter.replace(/^eq\./, '');
+      const val = tableRows.get(key);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(val !== undefined ? [{ value_text: val }] : []));
+    }
+
+    if (req.method === 'POST' && parsed.pathname === '/rest/v1/carrybee_kv') {
+      let raw = '';
+      for await (const c of req) raw += c;
+      const items = JSON.parse(raw);
+      for (const item of items) {
+        tableRows.set(item.key_name, item.value_text);
+      }
+      res.writeHead(201);
+      return res.end();
+    }
+
+    if (req.method === 'DELETE' && parsed.pathname === '/rest/v1/carrybee_kv') {
+      const keyFilter = parsed.searchParams.get('key_name') || '';
+      const key = keyFilter.replace(/^eq\./, '');
+      tableRows.delete(key);
+      res.writeHead(204);
+      return res.end();
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  try {
+    const store = createKVStore({
+      supabaseUrl: supabaseMock.url,
+      supabaseServiceKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test.sig'
+    });
+    assert.ok(store instanceof SupabaseKVStore);
+
+    await store.set('accounts-registry', '[{"id":"default","label":"Default"}]');
+    assert.equal(await store.get('accounts-registry'), '[{"id":"default","label":"Default"}]');
+    assert.equal(sawBearerHeader, true);
+
+    await store.delete('accounts-registry');
+    assert.equal(await store.get('accounts-registry'), null);
+  } finally {
+    await supabaseMock.close();
+  }
+});
+
+test('Vercel + Supabase dynamic /api/gateway-config links cleanly to a Docker host /openwa endpoint', async () => {
+  const tableRows = new Map([
+    ['accounts-registry', JSON.stringify([
+      { id: 'default', label: 'Default' },
+      { id: '01701207943', label: '01701207943' }
+    ])]
+  ]);
+
+  const supabaseMock = await listenServer(async (req, res) => {
+    const parsed = new URL(req.url, 'http://127.0.0.1');
+    if (req.method === 'GET' && parsed.pathname === '/rest/v1/carrybee_kv') {
+      const key = (parsed.searchParams.get('key_name') || '').replace(/^eq\./, '');
+      const val = tableRows.get(key);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(val !== undefined ? [{ value_text: val }] : []));
+    }
+    if (req.method === 'POST' && parsed.pathname === '/rest/v1/carrybee_kv') {
+      let raw = '';
+      for await (const c of req) raw += c;
+      for (const item of JSON.parse(raw)) tableRows.set(item.key_name, item.value_text);
+      res.writeHead(201);
+      return res.end();
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const mockOwa = createMockOpenWAServer({ apiKey: 'owa_k1_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' });
+  const owaInternal = await listenServer(mockOwa.handler);
+
+  // Docker host running CarryBee Bridge with `/openwa` passthrough enabled
+  const dockerStore = new SupabaseKVStore({ url: supabaseMock.url, serviceKey: 'eyJ.service' });
+  const dockerGateway = new OpenWAGateway({ baseUrl: owaInternal.url, apiKey: mockOwa.apiKey });
+  const dockerApp = createApp({
+    apiKey: 'master-bridge-key',
+    kvStore: dockerStore,
+    gateway: dockerGateway,
+    localOpenwaProxyTarget: owaInternal.url
+  });
+  const dockerHost = await listenServer(dockerApp);
+
+  // Stateless Vercel instance backed by the SAME Supabase store, initially with NO OpenWA env vars
+  const vercelStore = new SupabaseKVStore({ url: supabaseMock.url, serviceKey: 'eyJ.service' });
+  const vercelApp = createApp({
+    apiKey: 'master-bridge-key',
+    adminKeysRaw: 'Nahid:kam-restricted-key',
+    kvStore: vercelStore
+  });
+  const vercelHost = await listenServer(vercelApp);
+
+  try {
+    // Non-master KAM key is forbidden from reading or changing gateway-config
+    const forbiddenRes = await fetch(`${vercelHost.url}/api/gateway-config`, {
+      headers: { 'x-api-key': 'kam-restricted-key' }
+    });
+    assert.equal(forbiddenRes.status, 403);
+
+    // Master admin links Vercel to Docker host's `/openwa` endpoint via POST /api/gateway-config
+    const linkRes = await fetch(`${vercelHost.url}/api/gateway-config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': 'master-bridge-key' },
+      body: JSON.stringify({
+        base_url: `${dockerHost.url}/openwa`,
+        api_key: mockOwa.apiKey
+      })
+    });
+    assert.equal(linkRes.status, 200);
+    const linkJson = await linkRes.json();
+    assert.equal(linkJson.ok, true);
+    assert.equal(linkJson.storage_backend, 'supabase');
+    assert.equal(linkJson.openwa.ready, true);
+    assert.match(linkJson.masked_api_key, /^owa_k1_01••••cdef$/);
+
+    // Vercel now lists and initializes sessions on the remote Docker OpenWA container!
+    const accRes = await fetch(`${vercelHost.url}/api/accounts`, {
+      headers: { 'x-api-key': 'master-bridge-key' }
+    });
+    assert.equal(accRes.status, 200);
+    const accJson = await accRes.json();
+    assert.equal(accJson.accounts.length, 2);
+    assert.equal(accJson.accounts[1].id, '01701207943');
+    assert.equal(mockOwa.sessions.size, 2);
+  } finally {
+    await vercelHost.close();
+    await dockerHost.close();
+    await owaInternal.close();
+    await supabaseMock.close();
   }
 });

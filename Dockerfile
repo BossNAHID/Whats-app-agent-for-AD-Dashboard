@@ -8,7 +8,7 @@ WORKDIR /opt/carrybee-bridge
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
-COPY server.js openwa-gateway.js turso-store.js groups-config.json ./
+COPY server.js openwa-gateway.js turso-store.js supabase-store.js groups-config.json ./
 RUN chown -R openwa:openwa /opt/carrybee-bridge
 
 COPY docker/carrybee-start.sh /usr/local/bin/carrybee-start.sh
