@@ -640,6 +640,24 @@ test('Vercel + Supabase dynamic /api/gateway-config links cleanly to a Docker ho
     assert.equal(accJson.accounts.length, 2);
     assert.equal(accJson.accounts[1].id, '01701207943');
     assert.equal(mockOwa.sessions.size, 2);
+
+    // Non-master KAM key cannot download the Windows reconnect .bat script
+    const batForbidden = await fetch(`${vercelHost.url}/api/windows-reconnect-script`, {
+      headers: { 'x-api-key': 'kam-restricted-key' }
+    });
+    assert.equal(batForbidden.status, 403);
+
+    // Master key gets a valid CRLF standalone .bat reconnect script
+    const batRes = await fetch(`${vercelHost.url}/api/windows-reconnect-script`, {
+      headers: { 'x-api-key': 'master-bridge-key' }
+    });
+    assert.equal(batRes.status, 200);
+    const batText = await batRes.text();
+    assert.match(batText, /^@echo off\r\n/);
+    assert.match(batText, /\r\n# --- PS ---\r\n/);
+    assert.match(batText, /docker start openwa/);
+    assert.match(batText, /openwa-tunnel/);
+    assert.match(batText, /\/api\/gateway-config/);
   } finally {
     await vercelHost.close();
     await dockerHost.close();
