@@ -439,6 +439,135 @@ function createApp(options = {}) {
     });
   });
 
+  // Generates a standalone Windows 1-Click Desktop Reconnect (.bat) script (master API_KEY only)
+  // that starts Docker Desktop + OpenWA + Cloudflare Tunnel after PC shutdown and syncs the new tunnel URL to Supabase.
+  app.get('/api/windows-reconnect-script', requireApiKey, (req, res) => {
+    if (!req.isMasterAdmin) {
+      return res.status(403).json({ error: 'Master API_KEY required to generate reconnect script' });
+    }
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.get('host') || 'carrybee-whatsapp-bridge.vercel.app').split(',')[0].trim();
+    const bridgeOrigin = `${proto}://${host}`.replace(/\/+$/, '');
+    const psEsc = s => String(s || '').replace(/'/g, "''");
+
+    const scriptLines = [
+      '@echo off',
+      'setlocal',
+      'set "SELF=%~f0"',
+      'title CarryBee WhatsApp Bridge - 1-Click Auto-Connect',
+      'powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = Get-Content -LiteralPath $env:SELF -Encoding UTF8; $i = [Array]::IndexOf($c, \'# --- PS ---\'); Invoke-Expression ($c[($i+1)..($c.Length-1)] -join \\"`n\\")"',
+      'echo.',
+      'pause',
+      'exit /b',
+      '# --- PS ---',
+      `$bridgeUrl = '${psEsc(bridgeOrigin)}'`,
+      `$bridgeApiKey = '${psEsc(apiKey)}'`,
+      'Write-Host "====================================================" -ForegroundColor Cyan',
+      'Write-Host "  CarryBee WhatsApp Bridge - 1-Click Auto-Connect" -ForegroundColor Cyan',
+      'Write-Host "====================================================" -ForegroundColor Cyan',
+      'Write-Host ""',
+      'Write-Host "[1/4] Checking Docker Desktop..." -ForegroundColor Yellow',
+      'docker info *> $null',
+      'if ($LASTEXITCODE -ne 0) {',
+      '  $dockerExe = "C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe"',
+      '  if (Test-Path $dockerExe) {',
+      '    Write-Host "      Starting Docker Desktop (waiting ~30-60s for engine)..." -ForegroundColor Cyan',
+      '    Start-Process $dockerExe',
+      '  } else {',
+      '    Write-Host "      Please open Docker Desktop manually..." -ForegroundColor Red',
+      '  }',
+      '  $waited = 0',
+      '  do {',
+      '    Start-Sleep -Seconds 3',
+      '    $waited += 3',
+      '    Write-Host "      Waiting for Docker Engine... (${waited}s)" -ForegroundColor DarkGray',
+      '    docker info *> $null',
+      '  } while ($LASTEXITCODE -ne 0 -and $waited -lt 180)',
+      '  if ($LASTEXITCODE -ne 0) {',
+      '    Write-Host "ERROR: Docker Engine did not start within 3 minutes." -ForegroundColor Red',
+      '    exit 1',
+      '  }',
+      '}',
+      'Write-Host "      Docker Engine is running!" -ForegroundColor Green',
+      '',
+      'Write-Host "[2/4] Starting OpenWA WhatsApp Engine..." -ForegroundColor Yellow',
+      'docker start openwa *> $null',
+      'for ($i = 1; $i -le 30; $i++) {',
+      '  try {',
+      '    $localLive = Invoke-RestMethod -Uri "http://127.0.0.1:2785/api/health/live" -TimeoutSec 3 -ErrorAction Stop',
+      '    if ($localLive.status -eq "ok") { break }',
+      '  } catch {}',
+      '  Start-Sleep -Seconds 2',
+      '}',
+      'Write-Host "      OpenWA Engine is awake!" -ForegroundColor Green',
+      '',
+      'Write-Host "[3/4] Checking Cloudflare HTTPS Tunnel..." -ForegroundColor Yellow',
+      'docker start openwa-tunnel *> $null',
+      '$url = $null',
+      '$tunnelLive = $false',
+      '$initLogs = cmd /c "docker logs --tail 50 openwa-tunnel 2>&1" | Out-String',
+      '$initMatches = [regex]::Matches($initLogs, "https://[a-z0-9-]+\\.trycloudflare\\.com")',
+      'if ($initMatches.Count -gt 0) {',
+      '  $candidate = $initMatches[$initMatches.Count - 1].Value',
+      '  try {',
+      '    $chk = Invoke-RestMethod -Uri "$candidate/api/health/live" -TimeoutSec 5 -ErrorAction Stop',
+      '    if ($chk.status -eq "ok") { $url = $candidate; $tunnelLive = $true }',
+      '  } catch {}',
+      '}',
+      'if (-not $tunnelLive) {',
+      '  Write-Host "      Refreshing Cloudflare Tunnel for a new live HTTPS link..." -ForegroundColor Cyan',
+      '  $since = (Get-Date).AddSeconds(-2).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")',
+      '  docker restart openwa-tunnel *> $null',
+      '  for ($k = 1; $k -le 25; $k++) {',
+      '    Start-Sleep -Seconds 2',
+      '    $freshLogs = cmd /c "docker logs --since $since openwa-tunnel 2>&1" | Out-String',
+      '    $m = [regex]::Matches($freshLogs, "https://[a-z0-9-]+\\.trycloudflare\\.com")',
+      '    if ($m.Count -gt 0) {',
+      '      $candidate = $m[$m.Count - 1].Value',
+      '      try {',
+      '        $chk = Invoke-RestMethod -Uri "$candidate/api/health/live" -TimeoutSec 5 -ErrorAction Stop',
+      '        if ($chk.status -eq "ok") { $url = $candidate; $tunnelLive = $true; break }',
+      '      } catch {}',
+      '    }',
+      '  }',
+      '}',
+      'if (-not $url) {',
+      '  Write-Host "ERROR: Could not obtain a live Cloudflare Tunnel URL. Check internet & run again." -ForegroundColor Red',
+      '  exit 1',
+      '}',
+      'Write-Host "      Tunnel is live: $url" -ForegroundColor Green',
+      '',
+      'Write-Host "[4/4] Syncing tunnel URL to CarryBee Bridge (Vercel + Supabase)..." -ForegroundColor Yellow',
+      'try {',
+      '  $body = @{ base_url = $url } | ConvertTo-Json',
+      '  $res = Invoke-RestMethod -Uri "$bridgeUrl/api/gateway-config" -Method Post -Headers @{ "x-api-key" = $bridgeApiKey; "Content-Type" = "application/json" } -Body $body -TimeoutSec 25 -ErrorAction Stop',
+      '  $st = Invoke-RestMethod -Uri "$bridgeUrl/api/status" -TimeoutSec 20 -ErrorAction SilentlyContinue',
+      '  Write-Host ""',
+      '  Write-Host "====================================================" -ForegroundColor Green',
+      '  Write-Host "  SUCCESS! CarryBee WhatsApp Bridge is CONNECTED!" -ForegroundColor Green',
+      '  Write-Host "====================================================" -ForegroundColor Green',
+      '  Write-Host "  Admin Page : $bridgeUrl/admin"',
+      '  Write-Host "  Tunnel URL : $($res.base_url)"',
+      '  if ($st -and $st.accounts) {',
+      '    Write-Host ""',
+      '    Write-Host "  WhatsApp Accounts:" -ForegroundColor Cyan',
+      '    foreach ($acc in $st.accounts) {',
+      '      $state = if ($acc.ready) { "CONNECTED ($($acc.phone))" } else { "Not scanned yet ($($acc.last_status))" }',
+      '      $clr = if ($acc.ready) { "Green" } else { "Yellow" }',
+      '      Write-Host "   - $($acc.label) [$($acc.id)] : $state" -ForegroundColor $clr',
+      '    }',
+      '  }',
+      '} catch {',
+      '  Write-Host "ERROR syncing with Vercel: $($_.Exception.Message)" -ForegroundColor Red',
+      '  exit 1',
+      '}'
+    ];
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="Start-CarryBee-WhatsApp.bat"');
+    return res.send(scriptLines.join('\r\n') + '\r\n');
+  });
+
   // Status page
   app.get('/', async (req, res) => {
     const [{ accounts, gatewayError }, health] = await Promise.all([
@@ -922,6 +1051,7 @@ function createApp(options = {}) {
       </div>
       <button onclick="saveGatewayConfig()">Save &amp; Test OpenWA Connection</button>
       <button class="secondary" onclick="loadGatewayConfig()" style="margin-left:6px;">Check Current Gateway</button>
+      <button class="secondary" onclick="downloadReconnectScript()" style="margin-left:6px;">⬇ Download 1-Click PC Reconnect (.bat)</button>
       <div id="gwMsg"></div>
 
       <h2>1. WhatsApp accounts</h2>
@@ -1061,6 +1191,32 @@ function createApp(options = {}) {
             } else {
               showMsg('gwMsg', 'Saved in ' + esc(data.storage_backend) + ', but OpenWA returned: ' + esc(gw.error || 'Still warming up'), false);
             }
+          } catch (e) {
+            showMsg('gwMsg', esc(e.message), false);
+          }
+        }
+
+        async function downloadReconnectScript() {
+          if (!key()) { showMsg('gwMsg', 'Enter your Bridge API key at the top first, then click Download.', false); return; }
+          try {
+            const res = await fetch('/api/windows-reconnect-script', {
+              headers: { 'x-api-key': key() }
+            });
+            if (!res.ok) {
+              const errJson = await res.json().catch(() => ({}));
+              throw new Error(errJson.error || ('Request failed: ' + res.status));
+            }
+            const batText = await res.text();
+            const blob = new Blob([batText], { type: 'text/plain;charset=utf-8' });
+            const dlUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = dlUrl;
+            a.download = 'Start-CarryBee-WhatsApp.bat';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(dlUrl);
+            showMsg('gwMsg', 'Downloaded <code>Start-CarryBee-WhatsApp.bat</code>! Move it to your Desktop — every time you turn on your PC, double-click it to auto-start Docker, refresh the tunnel, and reconnect automatically.', true);
           } catch (e) {
             showMsg('gwMsg', esc(e.message), false);
           }
