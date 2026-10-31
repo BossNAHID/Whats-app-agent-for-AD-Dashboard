@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Render (and other PaaS) inject PORT for the public HTTP server (CarryBee Bridge).
+# Public HTTP server port for CarryBee Bridge (+ /openwa passthrough).
 # OpenWA runs internally on OPENWA_INTERNAL_PORT (default 2785) so the two
 # processes never collide on the same port.
 BRIDGE_PORT="${PORT:-3000}"
@@ -39,9 +39,9 @@ if [ -z "$RESOLVED_OPENWA_KEY" ]; then
 fi
 
 # Auto-detect container RAM limit when ENGINE_TYPE is not explicitly set:
-# - On < 1400 MB containers (e.g. Render 512 MB Free/Starter), Chromium (whatsapp-web.js)
-#   would immediately OOM-kill with 3 WhatsApp accounts, so auto-select ENGINE_TYPE=baileys.
-# - On >= 1400 MB hosts (e.g. 2-3 GB KVM VPS or Render Standard), use OpenWA's default
+# - On < 1400 MB containers, Chromium (whatsapp-web.js) would OOM-kill with 3 WhatsApp accounts,
+#   so auto-select ENGINE_TYPE=baileys.
+# - On >= 1400 MB hosts (e.g. 2-3 GB KVM VPS or local PC), use OpenWA's default
 #   whatsapp-web.js (headless Chromium) engine.
 DETECTED_MEM_MB="$(node -e "
   const fs = require('fs');
@@ -67,7 +67,7 @@ if [ -z "$RESOLVED_ENGINE" ]; then
     if [ -z "$OPENWA_NODE_OPTS" ]; then
       OPENWA_NODE_OPTS="--max-old-space-size=256"
     fi
-    echo "[carrybee-start] Detected ${DETECTED_MEM_MB} MB RAM (< 1400 MB) — auto-selecting OpenWA ENGINE_TYPE=baileys to prevent OOM on 512 MB Render."
+    echo "[carrybee-start] Detected ${DETECTED_MEM_MB} MB RAM (< 1400 MB) — auto-selecting OpenWA ENGINE_TYPE=baileys to prevent OOM on low-memory host."
   else
     echo "[carrybee-start] Detected ${DETECTED_MEM_MB} MB RAM — using OpenWA default whatsapp-web.js (Chromium) engine."
   fi
