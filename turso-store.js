@@ -1,14 +1,58 @@
+const fs = require('fs');
+const path = require('path');
+
+function normalizeTursoUrl(rawUrl) {
+  if (!rawUrl) return '';
+  const trimmed = String(rawUrl).trim();
+  if (trimmed.startsWith('libsql://')) {
+    const hostPath = trimmed.slice('libsql://'.length).replace(/\/+$/, '');
+    return hostPath.endsWith('/v2/pipeline')
+      ? `https://${hostPath}`
+      : `https://${hostPath}/v2/pipeline`;
+  }
+  return trimmed;
+}
+
 class TursoKVStore {
-  constructor({ url, token }) {
-    this.url = url;
-    this.token = token;
+  constructor({ url, token, localFilePath } = {}) {
+    this.url = normalizeTursoUrl(url);
+    this.token = token ? String(token).trim() : '';
+    this.useLocalFallback = !(this.url && this.token);
+    this.localFilePath = localFilePath
+      || process.env.BRIDGE_LOCAL_KV_FILE
+      || path.join(__dirname, 'data', 'bridge-kv.json');
     this.ready = false;
+    this._warnedFallback = false;
+  }
+
+  _readLocalStore() {
+    if (!this._warnedFallback) {
+      this._warnedFallback = true;
+      console.log(`[turso-store] TURSO_DB_URL/TURSO_DB_TOKEN not configured — storing bridge config locally at ${this.localFilePath}`);
+    }
+    try {
+      if (!fs.existsSync(this.localFilePath)) return {};
+      return JSON.parse(fs.readFileSync(this.localFilePath, 'utf8')) || {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  _writeLocalStore(obj) {
+    const dir = path.dirname(this.localFilePath);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmpPath = `${this.localFilePath}.tmp-${process.pid}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(obj, null, 2), 'utf8');
+    fs.renameSync(tmpPath, this.localFilePath);
   }
 
   async _run(requests) {
     const res = await fetch(this.url, {
       method: 'POST',
-      headers: { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' },
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify({ requests: [...requests, { type: 'close' }] })
     });
     if (!res.ok) throw new Error(`Turso HTTP ${res.status}`);
@@ -38,6 +82,9 @@ class TursoKVStore {
     });
   }
 
+  // Table name `baileys_auth` is kept intentionally so existing production
+  // Turso databases keep all saved `group-mapping`, `kam-account-mapping`,
+  // and `accounts-registry` rows with zero data migration needed.
   async _ensureTable() {
     if (this.ready) return;
     await this._query(`CREATE TABLE IF NOT EXISTS baileys_auth (
@@ -49,6 +96,10 @@ class TursoKVStore {
   }
 
   async get(key) {
+    if (this.useLocalFallback) {
+      const data = this._readLocalStore();
+      return Object.prototype.hasOwnProperty.call(data, key) ? data[key] : null;
+    }
     await this._ensureTable();
     const rows = await this._query('SELECT value_text FROM baileys_auth WHERE key_name = ?', [key]);
     return rows.length ? rows[0].value_text : null;
@@ -60,6 +111,14 @@ class TursoKVStore {
 
   async setMany(entries) {
     if (!entries.length) return;
+    if (this.useLocalFallback) {
+      const data = this._readLocalStore();
+      for (const { key, value } of entries) {
+        data[String(key)] = String(value);
+      }
+      this._writeLocalStore(data);
+      return;
+    }
     await this._ensureTable();
     const now = new Date().toISOString();
     const requests = entries.map(({ key, value }) => ({
@@ -82,6 +141,14 @@ class TursoKVStore {
 
   async deleteMany(keys) {
     if (!keys.length) return;
+    if (this.useLocalFallback) {
+      const data = this._readLocalStore();
+      for (const key of keys) {
+        delete data[String(key)];
+      }
+      this._writeLocalStore(data);
+      return;
+    }
     await this._ensureTable();
     const requests = keys.map(key => ({
       type: 'execute',
@@ -91,66 +158,6 @@ class TursoKVStore {
       }
     }));
     await this._run(requests);
-  }
-
-  // Wipes the entire table. Kept only for backwards compatibility with
-  // any code that still calls it directly — prefer clearAccountSession()
-  // below, which is scoped to one WhatsApp account so wiping a dead
-  // session never nukes other accounts' creds or the group mapping.
-  async clearAll() {
-    await this._ensureTable();
-    await this._query('DELETE FROM baileys_auth');
-  }
-
-  // ---------- outgoing message cache (for Baileys retry receipts) ----------
-  // Stored as regular rows in the same table, under an "outgoing::" key
-  // prefix, so it survives a Render restart/spin-down the same way the
-  // session creds already do — that's the whole point of this fix.
-  async rememberOutgoing(msgKey, message) {
-    await this.set(`outgoing::${msgKey}`, JSON.stringify(message));
-  }
-
-  async getOutgoing(msgKey) {
-    const raw = await this.get(`outgoing::${msgKey}`);
-    if (!raw) return null;
-    try { return JSON.parse(raw); } catch (e) { return null; }
-  }
-
-  // Retry receipts only ever arrive within minutes of the original send,
-  // so anything older than a day is just dead weight. Called on a timer,
-  // not on every send, to keep the hot path (sendMessage) to one write.
-  async pruneOutgoing(maxAgeMs) {
-    await this._ensureTable();
-    const cutoff = new Date(Date.now() - maxAgeMs).toISOString();
-    await this._query(
-      "DELETE FROM baileys_auth WHERE key_name LIKE 'outgoing::%' AND updated_at < ?",
-      [cutoff]
-    );
-  }
-
-  // Wipes only the stored session for one WhatsApp account. Used when
-  // WhatsApp reports that account's session as logged out — the stored
-  // creds are dead, so we clear just that account's keys and start it
-  // clean, leaving every other account and the group mapping untouched.
-  //
-  // keyPrefix is '' for the original/default account (whose keys are
-  // bare, e.g. "creds", "pre-key-1") and "<accountId>::" for any
-  // additionally-added account.
-  async clearAccountSession(keyPrefix) {
-    await this._ensureTable();
-    if (keyPrefix) {
-      await this._query(
-        "DELETE FROM baileys_auth WHERE key_name LIKE ?",
-        [`${keyPrefix}%`]
-      );
-    } else {
-      // Default account: its keys never contain "::", so scope the
-      // delete to bare keys and explicitly spare the two singleton
-      // keys that aren't part of any account's session.
-      await this._query(
-        "DELETE FROM baileys_auth WHERE key_name NOT LIKE '%::%' AND key_name NOT IN ('group-mapping', 'accounts-registry')"
-      );
-    }
   }
 }
 

@@ -1,137 +1,122 @@
-# CarryBee WhatsApp Bridge
+# CarryBee WhatsApp Bridge (OpenWA Edition)
 
-Sends a message to a specific WhatsApp group automatically whenever a KAM saves a remark on the dashboard — using one or more WhatsApp numbers, connected via `Baileys`.
+Sends remarks from the **CarryBee AD Dashboard** into mapped WhatsApp groups automatically — powered by **[OpenWA (`open-wa.org`)](https://www.open-wa.org/#quickstart)** and its official `@rmyndharis/openwa` SDK instead of direct Baileys sockets.
 
-## ⚠️ Important — read before using
+## Why OpenWA?
 
-- Baileys automates WhatsApp Web. It is **not** an official WhatsApp/Meta API, and using it goes against WhatsApp's Terms of Service. There is a real risk (usually low if usage stays moderate and human-like, but non-zero) that a connected number gets flagged, rate-limited, or banned.
-- Each account connects to whichever number scans its QR code (or enters its pairing code). Every message sent through that account uses that number's identity.
-- It needs a server that **stays running continuously**, with the sessions persisted in Turso (see Setup below). If Turso is wiped, every connected account will need to reconnect.
-- If a number ever gets banned, there's no official appeal path the way there is with the Business API.
+- **Fixes *"Waiting for this message"* in groups:** OpenWA runs `whatsapp-web.js` (real WhatsApp Web inside headless Chromium) by default, so WhatsApp's own web client manages Signal `SenderKey` group encryption and retry receipts natively.
+- **Zero AD Dashboard changes:** Keeps the exact same `/api/send-remark`, `/admin`, `/qr/:accountId`, `/pair/:accountId`, and Turso group & KAM mappings.
+- **Seamless Render → KVM VPS move:** Because all group mappings, KAM email mappings, and account labels live in **Turso**, you can run on **Render** for a few days right now and move to your **Ubuntu KVM VPS** later without re-entering a single mapping.
 
-If you want zero risk long-term, the alternative is manually pasting remarks into WhatsApp, or later moving to the official WhatsApp Business API for 1:1 merchant messages (note: the official API does **not** support posting into groups at all, only individual chats).
+---
 
-## Multiple WhatsApp accounts
+## Option A — Run on Render Right Now (Temporary for a Few Days)
 
-[#multiple-whatsapp-accounts](#multiple-whatsapp-accounts)
+This repo includes an all-in-one `Dockerfile` + `render.yaml` that runs **both OpenWA Gateway and CarryBee Bridge inside one container**.
 
-The bridge now supports connecting **more than one WhatsApp number** at once — useful when different KAMs each need to send from their own number into their own groups, since only an account that's actually a member of a WhatsApp group can post into it.
+> **Important Render sizing note:** Because OpenWA launches headless Chromium (`whatsapp-web.js`), select at least Render's **Standard (2 GB RAM)** plan and attach a **Render Disk** mounted at `/app/data` (10 GB). Render bills **hourly (prorated)**, so running it for a few days and deleting it once your VPS is live only charges for the hours used. *(512 MB Starter instances will run out of memory when Chromium opens WhatsApp Web.)*
 
-- There's always one **default** account (the original one — if you're upgrading from a single-account setup, it keeps using the exact same stored session, so it does **not** need to re-scan a QR code).
-- You can add more accounts from `/admin` (or `POST /api/accounts`), each with its own label, its own QR/pairing-code page, and its own independent connection.
-- Each dashboard→group mapping now records **which account** should send to that group. A KAM's remark goes out through whichever number is mapped to that group.
-- Removing an account only wipes that account's own session — it never touches any other account's connection or the saved group mappings.
+### Deploy via Render Blueprint (1-click) or Existing Service:
+1. Push this branch / merge to `main` on GitHub.
+2. In Render Dashboard:
+   - **New setup:** Click **New + → Blueprint**, select this repo, and enter `API_KEY`, `TURSO_DB_URL`, and `TURSO_DB_TOKEN`.
+   - **Updating an existing Render Web Service:**
+     1. Go to **Settings → Build & Deploy** and set **Language / Runtime** to **`Docker`**.
+     2. Set **Instance Type** to **`Standard` (2 GB RAM)**.
+     3. Go to **Disks → Add Disk**: Name `openwa-data`, Mount Path **`/app/data`**, Size `10 GB`.
+     4. Under **Environment**, keep your existing `API_KEY`, `TURSO_DB_URL`, `TURSO_DB_TOKEN` and add `NODE_ID=carrybee-openwa-1` and `AUTO_START_SESSIONS=true`.
+3. Once deployed, **unlink the old Baileys device** on each phone (**WhatsApp → Linked devices → Log out**), then open `https://your-render-url.onrender.com/admin` and scan each account's `/qr/<accountId>` page.
 
-## What it does
+---
 
-[#what-it-does](#what-it-does)
+## Option B — Move to Your Ubuntu KVM VPS (Permanent Setup)
 
-1. You run this service. For each WhatsApp account you want connected, you open its QR page once (like linking WhatsApp Web) or use a pairing code instead.
-2. For each dashboard "group name", you tell the bridge which real WhatsApp group ID it maps to **and** which connected account should send there (one-time mapping, editable anytime).
-3. Your dashboard calls one HTTP endpoint whenever a KAM saves a remark. This service sends that remark into the matching WhatsApp group, via the mapped account.
+When your **Ubuntu 22.04 / 24.04 KVM VPS** (e.g. XeonBD `VPS 2022v2` — 2 vCPU, 3 GB RAM) is ready, SSH in as `root` and run:
 
-## Setup
+```bash
+# 1. Install Docker + Compose plugin
+apt update && apt install -y ca-certificates curl git
+curl -fsSL https://get.docker.com | sh
 
-[#setup](#setup)
+# 2. Add 2 GB swap file (extra safety headroom for Chromium spikes)
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
 
+# 3. Clone this repo & configure .env
+git clone https://github.com/BossNAHID/Whats-app-agent-for-AD-Dashboard.git
+cd Whats-app-agent-for-AD-Dashboard
+cp .env.example .env
+nano .env   # Paste your same API_KEY, TURSO_DB_URL, and TURSO_DB_TOKEN
+
+# 4. Build & start OpenWA + CarryBee Bridge in the background
+docker compose up -d --build
 ```
+
+Then:
+1. Open `http://YOUR_VPS_IP:3000/admin` — all your existing accounts, group mappings, and KAM mappings from Turso will already be loaded!
+2. Scan `/qr/<accountId>` once for each WhatsApp number.
+3. Update the bridge URL in your AD Dashboard to `http://YOUR_VPS_IP:3000` (or put a free Cloudflare / Nginx / Caddy HTTPS domain in front of port `3000`), then delete the temporary Render service.
+
+---
+
+## Option C — Local Development / Split Hosting (Bridge on Vercel + External OpenWA)
+
+If you run OpenWA separately (for example `docker run -p 2785:2785 -v ./openwa-data:/app/data ghcr.io/rmyndharis/openwa:latest`) and want to run just the stateless CarryBee Bridge locally or on Vercel:
+
+```bash
 npm install
 cp .env.example .env
-# edit .env: set API_KEY to something private, and your Turso credentials
+# Set API_KEY, TURSO_DB_URL, TURSO_DB_TOKEN, OPENWA_BASE_URL, and OPENWA_API_KEY
 npm start
 ```
 
-Open `http://localhost:3000/admin` (or your deployed URL + `/admin`) to add accounts, connect them, and set up group mappings — all from one page. Or use `http://localhost:3000/` for a quick read-only status view of every connected account.
+---
 
-## Connecting an account
+## Wiring into the CarryBee AD Dashboard
 
-[#connecting-an-account](#connecting-an-account)
+Unchanged from v2 — your dashboard calls `POST /api/send-remark`:
 
-1. From `/admin`, add a new account with a label (e.g. "Asif's CarryBee number"), or use the pre-existing default account.
-2. Open its `/qr/<accountId>` link and scan it with: **WhatsApp on your phone → Settings → Linked devices → Link a device** — or use `/pair/<accountId>?phone=YOURNUMBER` to type a code instead.
-3. Once connected, `/admin` shows that account as "Connected" along with the WhatsApp name it logged in as.
-
-## Map your dashboard group names to real WhatsApp groups
-
-[#map-your-dashboard-group-names-to-real-whatsapp-groups](#map-your-dashboard-group-names-to-real-whatsapp-groups)
-
-Easiest via `/admin`: pick the account that's a member of the target group, load its groups, and save the mapping from the dropdown. Or via the API:
-
-1. Make sure the WhatsApp account you want to send from is already a member of the target group(s).
-2. Call:
-
-```
-curl http://localhost:3000/api/groups/YOUR_ACCOUNT_ID -H "x-api-key: YOUR_API_KEY"
-```
-
-This lists every group that account is in, with its `id` (looks like `1203630xxxxxxxxx@g.us`).
-
-3. Map a dashboard group name to that ID and account:
-
-```
-curl -X POST http://localhost:3000/api/mapping \
-  -H "x-api-key: YOUR_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"dashboard_name": "CarryBee Issue Group || NN1", "group_id": "1203630xxxxxxxxx@g.us", "account_id": "YOUR_ACCOUNT_ID"}'
-```
-
-Omitting `account_id` maps it to the default account, for backwards compatibility.
-
-4. Repeat for every group name your dashboard uses. You can also remove a mapping with `DELETE /api/mapping/:dashboard_name`.
-
-## Wiring it into your dashboard
-
-[#wiring-it-into-your-dashboard](#wiring-it-into-your-dashboard)
-
-Wherever your dashboard currently saves a KAM's remark (the code that writes it to Sheets/Turso), add one more call right after — this part is unchanged, the bridge figures out which account to use internally based on the mapping:
-
-```
-await fetch('https://your-bridge-url.onrender.com/api/send-remark', {
+```js
+await fetch('https://your-bridge-host/api/send-remark', {
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
     'x-api-key': 'YOUR_API_KEY'
   },
   body: JSON.stringify({
-    group_name: 'CarryBee Issue Group || NN1',  // exactly as shown on your dashboard
+    group_name: 'CarryBee Issue Group || NN1', // matched case/whitespace-insensitively
     message: remarkText,
-    ticket_id: 'CB-0816-00856',                  // optional, gets bolded at the top
-    kam_name: 'Nuruzzaman Nahid'                  // optional, gets added as a signature
+    kam_email: 'nuruzzaman.nahid@carrybee.com' // optional: routes via that KAM's mapped WA number
   })
 });
 ```
 
-If you share the dashboard's remark-saving code (or the repo), I can write this integration directly into it instead of you wiring it by hand.
+---
 
-## Deploying on Render
+## Endpoints Summary
 
-[#deploying-on-render](#deploying-on-render)
-
-- Use a **paid** web service instance (not free tier) — free tier sleeps after inactivity, which drops every WhatsApp session.
-- Sessions for all accounts are stored in Turso (not on local disk), so no persistent disk is required for reconnects — but the service still needs to stay running to keep the live socket connections open.
-- Set `API_KEY`, `TURSO_DB_URL`, and `TURSO_DB_TOKEN` as environment variables in Render's dashboard, not committed to the repo.
-
-## Endpoints summary
-
-[#endpoints-summary](#endpoints-summary)
-
-| Method | Path                             | Purpose                                                  |
-| ------ | --------------------------------- | --------------------------------------------------------- |
-| GET    | `/`                                | Status page for all accounts                               |
-| GET    | `/admin`                          | Manage accounts and group mappings                          |
-| GET    | `/qr/:accountId`                  | Scan to connect a specific account                          |
-| GET    | `/pair/:accountId`                | Pairing-code page for a specific account                    |
-| GET    | `/api/status`                     | JSON connection status for every account                    |
-| GET    | `/api/status/:accountId`          | JSON connection status for one account                      |
-| GET    | `/api/accounts`                   | List all accounts (needs `x-api-key`)                       |
-| POST   | `/api/accounts`                   | Add a new account: `{ "label": "..." }` (needs `x-api-key`) |
-| DELETE | `/api/accounts/:accountId`        | Remove an account, wiping only its own session (needs `x-api-key`) |
-| GET    | `/api/groups/:accountId`          | List WhatsApp groups + IDs for one account (needs `x-api-key`) |
-| GET    | `/api/mapping`                    | View current dashboard→group mapping                        |
-| POST   | `/api/mapping`                    | Add/update a mapping entry (now includes `account_id`)      |
-| DELETE | `/api/mapping/:dashboard_name`    | Remove a mapping entry                                       |
-| POST   | `/api/send-remark`                | Send a remark to its mapped group, via the mapped account    |
+| Method | Path                             | Purpose                                                             |
+| ------ | -------------------------------- | ------------------------------------------------------------------- |
+| GET    | `/`                              | Live status page for OpenWA Gateway + all WhatsApp accounts         |
+| GET    | `/admin`                         | Manage accounts, WhatsApp groups, group mappings, and KAM mappings  |
+| GET    | `/qr/:accountId`                 | Scan QR code (generated by OpenWA) to connect an account            |
+| GET    | `/pair/:accountId`               | Phone pairing-code page for a specific account                      |
+| GET    | `/api/health`                    | Health check for Render / Docker (`bridge` + `openwa` readiness)    |
+| GET    | `/api/status`                    | JSON connection status for every account                            |
+| GET    | `/api/status/:accountId`         | JSON connection status for one account                              |
+| GET    | `/api/accounts`                  | List all accounts (needs `x-api-key`)                               |
+| POST   | `/api/accounts`                  | Add a new account `{ "label": "..." }` (needs `x-api-key`)          |
+| POST   | `/api/accounts/:accountId/restart` | Restart an account's OpenWA session (needs `x-api-key`)           |
+| DELETE | `/api/accounts/:accountId`       | Unlink & remove an account (needs `x-api-key`)                      |
+| GET    | `/api/groups/:accountId`         | List all WhatsApp groups + `@g.us` IDs for an account (`x-api-key`) |
+| GET    | `/api/mapping`                   | View dashboard group name → WhatsApp group mappings (`x-api-key`)   |
+| POST   | `/api/mapping`                   | Save a group mapping `{ dashboard_name, group_id, account_id }`     |
+| DELETE | `/api/mapping/:dashboard_name`   | Remove a group mapping (`x-api-key`)                                |
+| GET    | `/api/kam-mapping`               | View KAM email → sending WhatsApp account mappings (`x-api-key`)    |
+| POST   | `/api/kam-mapping`               | Save a KAM mapping `{ email, account_id }` (`x-api-key`)            |
+| DELETE | `/api/kam-mapping/:email`        | Remove a KAM mapping (`x-api-key`)                                  |
+| POST   | `/api/send-remark`               | Send a remark to its mapped WhatsApp group via OpenWA (`x-api-key`) |
 
 ---
 
-Powered by NAHID
+Powered by NAHID · Engine by [OpenWA](https://www.open-wa.org)
