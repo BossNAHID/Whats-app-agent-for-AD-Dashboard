@@ -1,19 +1,16 @@
-# Render Blueprint — Temporary all-in-one deployment (OpenWA + CarryBee Bridge)
-# Note: OpenWA uses headless Chromium (whatsapp-web.js), which requires >= 2 GB RAM (`standard` plan)
-# and a persistent disk at /app/data so WhatsApp sessions survive restarts.
-# Render bills hourly (prorated), so running this for a few days until your KVM VPS is ready
-# only charges for the hours used.
+# Render Blueprint — Temporary Docker deployment (OpenWA + CarryBee Bridge)
+# Defaults to `plan: free` so you can deploy on Render with NO credit card while waiting for your VPS!
+# - On 512 MB (`free`/`starter`), `carrybee-start.sh` automatically selects OpenWA's lightweight
+#   `baileys` engine so 3+ accounts fit in 512 MB without crashing.
+# - On >= 2 GB RAM (your 3 GB KVM VPS, or Render `standard` + Disk), it automatically runs
+#   `whatsapp-web.js` (headless Chromium).
 
 services:
   - type: web
-    name: carrybee-whatsapp-bridge
+    name: carrybee-openwa-bridge
     runtime: docker
-    plan: standard
+    plan: free
     healthCheckPath: /api/health
-    disk:
-      name: openwa-data
-      mountPath: /app/data
-      sizeGB: 10
     envVars:
       - key: API_KEY
         sync: false
