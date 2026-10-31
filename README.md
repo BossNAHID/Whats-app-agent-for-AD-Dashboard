@@ -1,9 +1,9 @@
 # CarryBee WhatsApp Bridge (OpenWA + Vercel + Supabase Edition)
 
 Sends remarks from the **CarryBee AD Dashboard** into mapped WhatsApp groups automatically — powered by:
-1. **Vercel** — permanent HTTPS front-end (`/api/send-remark`, `/admin`, `/qr/:accountId`, `/pair/:accountId`) so your AD Dashboard URL never has to change.
+1. **Vercel** — permanent HTTPS front-end (`/api/send-remark`, `/admin`, `/qr/:accountId`, `/pair/:accountId`) so your AD Dashboard URL never changes.
 2. **Supabase PostgreSQL (`public.carrybee_kv`)** — permanent cloud storage for WhatsApp accounts, Merchant group mappings, KAM routing, and your active OpenWA Gateway URL.
-3. **[OpenWA (`open-wa.org`)](https://www.open-wa.org/#quickstart)** (`@rmyndharis/openwa`) — Docker WhatsApp Web engine that eliminates Baileys Signal `SenderKey` *"Waiting for this message"* group decryption issues.
+3. **[OpenWA (`open-wa.org`)](https://www.open-wa.org/#quickstart)** (`@rmyndharis/openwa`) — Docker WhatsApp Web engine (`whatsapp-web.js` Chromium) that eliminates Baileys Signal `SenderKey` *"Waiting for this message"* group decryption issues.
 
 ---
 
@@ -18,12 +18,11 @@ Sends remarks from the **CarryBee AD Dashboard** into mapped WhatsApp groups aut
            │  OpenWA SDK (/openwa)
            ▼
 [ OpenWA Docker Engine ]
-  • Today: Render Free Docker (no card needed) or local Docker + Cloudflare Tunnel
-  • Permanent: XeonBD Ubuntu KVM VPS (`docker compose up -d --build`)
+  • Permanent: Ubuntu KVM VPS (`docker compose up -d --build`)
+  • Local Testing: Your PC (`docker compose up -d --build` + Cloudflare Quick Tunnel)
 ```
 
-Because Vercel Serverless Functions cannot hold persistent 24/7 WhatsApp TCP/Chromium processes on their own, **OpenWA runs inside Docker** and links automatically to your Vercel + Supabase bridge!
-- When you move from Render Free Docker to your XeonBD KVM VPS in a few days, **your AD Dashboard URL (`https://...vercel.app`) and all Supabase mappings stay 100% untouched**.
+Because Vercel Serverless Functions sleep between HTTP requests and cannot keep a 24/7 WhatsApp Web / Chromium daemon open by themselves, **OpenWA runs inside Docker** (on your KVM VPS or local PC) and links directly to your permanent **Vercel + Supabase** bridge!
 
 ---
 
@@ -38,21 +37,9 @@ Set these 3 environment variables on your Vercel project:
 
 ---
 
-## Step 2A — Run the OpenWA Engine on Render Free Docker (Temporary — No Card Needed)
+## Step 2 — Run the OpenWA Docker Engine on Your Ubuntu KVM VPS
 
-1. In Render Dashboard, click **New + → Web Service** (or **Blueprint**) and connect this GitHub repo.
-2. **Important:** Choose **Language / Runtime = `Docker`** and **Instance Type = `Free`** ($0, no card needed; `carrybee-start.sh` auto-detects 512 MB RAM and selects OpenWA's lightweight engine so 3+ accounts fit safely).
-3. Under **Environment**, add the exact same:
-   - `API_KEY`
-   - `SUPABASE_URL`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-4. Deploy! On boot, the Render Docker container **automatically registers its `RENDER_EXTERNAL_URL/openwa` + OpenWA API key inside Supabase**, so your Vercel `/admin` connects immediately with zero manual steps!
-
----
-
-## Step 2B — Move OpenWA Engine to Your Ubuntu KVM VPS (Permanent 3 GB RAM Setup)
-
-When your **Ubuntu 22.04 / 24.04 KVM VPS** (e.g. XeonBD `VPS 2022v2` — 2 vCPU, 3 GB RAM) is ready, SSH in as `root` and run:
+On your **Ubuntu 22.04 / 24.04 KVM VPS** (e.g. XeonBD `VPS 2022v2` — 2 vCPU, 3 GB RAM), SSH in as `root` and run:
 
 ```bash
 # 1. Install Docker + Compose plugin
@@ -78,7 +65,13 @@ nano .env
 docker compose up -d --build
 ```
 
-On boot, your VPS automatically updates `openwa-gateway-config` in Supabase to `http://YOUR_VPS_IP:3000/openwa` (or you can paste/test any OpenWA URL manually in **Vercel `/admin` → Section 0**). Scan `/qr/<accountId>` once per WhatsApp number, and delete the temporary Render service!
+On boot, your VPS automatically registers `http://YOUR_VPS_IP:3000/openwa` + its OpenWA API key inside Supabase so **`https://carrybee-whatsapp-bridge.vercel.app/admin`** connects immediately (or you can paste/test any OpenWA URL manually in **Section 0** of `/admin`).
+
+### Optional: Run OpenWA on Your Local PC Before Getting Your VPS
+If you want to connect WhatsApp right away from your own laptop/PC before buying your VPS:
+1. Install Docker Desktop, clone this repo, create `.env` (`API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`), and run `docker compose up -d --build`.
+2. Run a free Cloudflare Quick Tunnel (`cloudflared tunnel --url http://localhost:3000`) to get a temporary `https://....trycloudflare.com` URL.
+3. Paste that `https://....trycloudflare.com` URL + the key from `./openwa-data/.api-key` into **Section 0** on `https://carrybee-whatsapp-bridge.vercel.app/admin`.
 
 ---
 

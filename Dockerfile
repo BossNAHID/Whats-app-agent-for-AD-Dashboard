@@ -1,5 +1,5 @@
 # All-in-one image bundling OpenWA Gateway (https://www.open-wa.org) + CarryBee WhatsApp Bridge.
-# Works identically on Render (single Docker Web Service + Disk) and on a KVM VPS (docker compose up -d).
+# Runs on an Ubuntu KVM VPS or local machine via `docker compose up -d --build`.
 FROM ghcr.io/rmyndharis/openwa:latest
 
 # Install CarryBee Bridge alongside OpenWA (/app stays untouched).

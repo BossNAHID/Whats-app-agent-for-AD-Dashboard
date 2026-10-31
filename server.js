@@ -291,9 +291,9 @@ function createApp(options = {}) {
     }
   }
 
-  // When running inside the all-in-one Docker image (/app/dist/main present),
+  // When running inside the all-in-one Docker image (/app/dist/main.js present),
   // expose OpenWA's authenticated SDK API under `/openwa/*` (protected by OpenWA's 71-char API_MASTER_KEY)
-  // so single-port Docker hosts (like Render Free or VPS :3000) can seamlessly act as the remote
+  // so single-port Docker hosts (like VPS :3000 or Cloudflare Tunnel) can seamlessly act as the remote
   // OpenWA engine for the permanent Vercel + Supabase front-end with zero route collisions.
   const localOpenwaTarget = options.localOpenwaProxyTarget
     || (hasBundledOpenWA()
@@ -330,7 +330,7 @@ function createApp(options = {}) {
     });
   }
 
-  // Health probe for Vercel / Render / Docker Compose
+  // Health probe for Vercel / Docker Compose
   app.get('/api/health', async (req, res) => {
     const openwa = await gateway.checkHealth();
     res.json({
@@ -369,14 +369,14 @@ function createApp(options = {}) {
     const rawKey = String((req.body && req.body.api_key) || '').trim();
 
     if (!rawUrl) {
-      return res.status(400).json({ error: 'base_url is required (e.g. https://your-openwa.onrender.com or http://VPS_IP:2785)' });
+      return res.status(400).json({ error: 'base_url is required (e.g. http://VPS_IP:3000/openwa or http://VPS_IP:2785)' });
     }
 
     let parsedUrl;
     try {
       parsedUrl = new URL(rawUrl);
     } catch (_) {
-      return res.status(400).json({ error: 'Invalid URL. Include http:// or https:// (e.g. https://your-openwa.onrender.com)' });
+      return res.status(400).json({ error: 'Invalid URL. Include http:// or https:// (e.g. http://VPS_IP:3000/openwa)' });
     }
     if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
       return res.status(400).json({ error: 'URL must start with http:// or https://' });
@@ -396,7 +396,7 @@ function createApp(options = {}) {
 
     // Smart auto-detection when user pastes the root URL of a CarryBee Bridge host (without `/openwa`):
     // - If that host is running our Docker image, `${cleanBaseUrl}/openwa/api/health/live` returns 200 -> auto-append `/openwa`!
-    // - If that host is an old Node-only service (e.g. Render `Language: Node`), `/openwa` 404s -> return a clear 400 error instead of saving a broken URL.
+    // - If that host is a Node-only CarryBee Bridge (e.g. Vercel itself), `/openwa` 404s -> return a clear 400 error instead of saving a broken URL.
     if (!cleanBaseUrl.endsWith('/openwa')) {
       try {
         const probeRes = await fetch(`${cleanBaseUrl}/api/health`, {
@@ -413,7 +413,7 @@ function createApp(options = {}) {
               cleanBaseUrl = `${cleanBaseUrl}/openwa`;
             } else {
               return res.status(400).json({
-                error: `"${cleanBaseUrl}" is running in Node mode, NOT Docker mode — OpenWA is not installed on that service! On Render, an existing Node service cannot be converted to Docker: click "New + → Web Service", choose Language = "Docker", and deploy a NEW Docker service.`
+                error: `"${cleanBaseUrl}" is running in Node mode, NOT Docker mode — OpenWA is not installed on that URL! Point this field to your OpenWA Docker server (e.g. http://YOUR_VPS_IP:3000/openwa or a Cloudflare Tunnel URL).`
               });
             }
           }
@@ -908,12 +908,12 @@ function createApp(options = {}) {
       <input type="password" id="apiKey" placeholder="paste your API_KEY here" />
       <p style="font-size:11px;color:#888;">This stays only in your browser tab — it's sent with each button click below, nothing is saved anywhere.</p>
 
-      <h2>0. OpenWA Gateway Connection <small style="font-size:12px;color:#7a7566;font-weight:400;">(for Vercel / External Docker)</small></h2>
-      <p style="font-size:11px;color:#666;margin-top:-6px;">When CarryBee Bridge runs on <strong>Vercel + Supabase</strong>, paste your OpenWA Docker URL (Render Docker today, or XeonBD VPS IP in a few days) &amp; OpenWA API Key below. When running all-in-one inside Docker, this connects automatically.</p>
+      <h2>0. OpenWA Gateway Connection <small style="font-size:12px;color:#7a7566;font-weight:400;">(Vercel + OpenWA Docker)</small></h2>
+      <p style="font-size:11px;color:#666;margin-top:-6px;">CarryBee Bridge runs permanently here on <strong>Vercel + Supabase</strong>. Paste your OpenWA Docker Engine URL (your KVM VPS IP or local Docker tunnel) &amp; OpenWA API Key below — or set <code>PUBLIC_GATEWAY_URL</code> in your VPS <code>.env</code> so it registers automatically.</p>
       <div class="row">
         <div>
           <label>OpenWA Gateway URL</label>
-          <input type="text" id="gwBaseUrl" placeholder="https://your-openwa-docker.onrender.com  or  http://VPS_IP:2785" />
+          <input type="text" id="gwBaseUrl" placeholder="http://YOUR_VPS_IP:3000/openwa  or  https://your-tunnel.trycloudflare.com/openwa" />
         </div>
         <div>
           <label>OpenWA API Key <span id="gwKeyHint" style="color:#2E8B57;font-weight:400;"></span></label>
@@ -1253,9 +1253,9 @@ function createApp(options = {}) {
   });
 
   app.syncAccountsOnBoot = async function syncAccountsOnBoot({ maxAttempts = 10 } = {}) {
-    // If running inside Docker with a known public URL (e.g. Render Docker or VPS) and shared Supabase KV,
+    // If running inside Docker with PUBLIC_GATEWAY_URL and shared Supabase KV,
     // auto-register this OpenWA Gateway URL + API key so the Vercel front-end links automatically.
-    const publicGatewayUrl = (process.env.PUBLIC_GATEWAY_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
+    const publicGatewayUrl = (process.env.PUBLIC_GATEWAY_URL || '').trim().replace(/\/+$/, '');
     const localOpenwaKey = (process.env.OPENWA_API_KEY || '').trim();
     if (publicGatewayUrl && localOpenwaKey && hasBundledOpenWA()) {
       const gatewayEndpoint = publicGatewayUrl.endsWith('/openwa')

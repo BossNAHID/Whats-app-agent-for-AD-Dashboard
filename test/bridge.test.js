@@ -208,7 +208,7 @@ test('toSessionName produces valid 3-50 char alphanumeric-hyphen OpenWA session 
   assert.match(longResult, /^[a-z0-9-]+$/);
 });
 
-test('End-to-end CarryBee Bridge workflow via OpenWA SDK (accounts, QR, pairing, groups, KAM routing, send-remark, Render->VPS rebind)', async () => {
+test('End-to-end CarryBee Bridge workflow via OpenWA SDK (accounts, QR, pairing, groups, KAM routing, send-remark, fresh OpenWA rebind)', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'carrybee-test-'));
   const keyFile = path.join(tmpDir, '.api-key');
   const kvFile = path.join(tmpDir, 'bridge-kv.json');
@@ -353,7 +353,7 @@ test('End-to-end CarryBee Bridge workflow via OpenWA SDK (accounts, QR, pairing,
     assert.equal(mockOwa.sentMessages[0].chatId, '120363000111222@g.us');
     assert.equal(mockOwa.sentMessages[0].idempotencyKey, 'remark-cb-0816');
 
-    // 11. Simulate moving from Render to a fresh KVM VPS:
+    // 11. Simulate moving to a fresh KVM VPS OpenWA instance:
     // Wipe OpenWA's sessions Map (as if starting a brand-new OpenWA container on the VPS)
     // while keeping Turso / KV mappings intact. Verify automatic session re-creation by name!
     const oldAsifUuid = asifSession.id;
