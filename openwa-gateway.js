@@ -94,12 +94,18 @@ class OpenWAGateway {
     return '';
   }
 
+  isMissingBundledOpenWA() {
+    const isLocalDefault = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(this.baseUrl);
+    return isLocalDefault && !process.env.OPENWA_BASE_URL && !fs.existsSync('/app/dist/main');
+  }
+
   getClient() {
     const apiKey = this.resolveApiKey();
     if (!apiKey) {
-      const err = new Error(
-        `OpenWA API key is not available yet (set OPENWA_API_KEY or wait for ${this.keyFile} to be generated on first boot).`
-      );
+      const msg = this.isMissingBundledOpenWA()
+        ? 'OpenWA is not running because this service was deployed in Node.js mode instead of Docker mode. On Render, create a new Web Service with Language = Docker (an existing Node service ignores Dockerfile), or set OPENWA_BASE_URL and OPENWA_API_KEY.'
+        : `OpenWA Gateway is still initializing first-boot credentials (wait ~20s and click Refresh accounts, or set OPENWA_API_KEY).`;
+      const err = new Error(msg);
       err.code = 'OPENWA_KEY_MISSING';
       err.status = 503;
       throw err;
@@ -145,9 +151,10 @@ class OpenWAGateway {
     }
     // Network / connection refused (e.g. OpenWA still booting in container or not running)
     const msg = err.message || String(err);
-    const wrapped = new Error(
-      `Cannot reach OpenWA Gateway at ${this.baseUrl} (${msg}). Wait a few seconds if the service is still starting.`
-    );
+    const hint = this.isMissingBundledOpenWA()
+      ? 'This service is running in Node.js mode instead of Docker mode — redeploy using Language = Docker so Dockerfile starts OpenWA.'
+      : 'OpenWA Gateway is starting up inside Docker (usually takes ~20–30s on cold boot) — click Refresh accounts in a moment.';
+    const wrapped = new Error(`Cannot reach OpenWA Gateway at ${this.baseUrl} (${msg}). ${hint}`);
     wrapped.status = 503;
     wrapped.code = 'OPENWA_UNREACHABLE';
     wrapped.cause = err;
