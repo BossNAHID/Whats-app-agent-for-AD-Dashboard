@@ -85,7 +85,7 @@ function createApp(options = {}) {
 
   const storageBackend = kvStore instanceof SupabaseKVStore
     ? 'supabase'
-    : (kvStore && kvStore.hasTurso ? 'turso' : 'local');
+    : (kvStore && !kvStore.useLocalFallback ? 'turso' : 'local');
 
   let gatewayConfigCache = { value: null, expiresAt: 0 };
 
