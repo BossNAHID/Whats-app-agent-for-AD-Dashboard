@@ -386,12 +386,41 @@ function createApp(options = {}) {
       return res.status(400).json({ error: 'Disallowed gateway hostname' });
     }
 
-    const cleanBaseUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/+$/, '')}`;
+    let cleanBaseUrl = `${parsedUrl.origin}${parsedUrl.pathname.replace(/\/+$/, '')}`;
     const existing = (await loadGatewayConfig({ bypassCache: true })) || {};
     const finalApiKey = rawKey || existing.api_key || '';
 
     if (!finalApiKey) {
       return res.status(400).json({ error: 'api_key is required when connecting OpenWA for the first time' });
+    }
+
+    // Smart auto-detection when user pastes the root URL of a CarryBee Bridge host (without `/openwa`):
+    // - If that host is running our Docker image, `${cleanBaseUrl}/openwa/api/health/live` returns 200 -> auto-append `/openwa`!
+    // - If that host is an old Node-only service (e.g. Render `Language: Node`), `/openwa` 404s -> return a clear 400 error instead of saving a broken URL.
+    if (!cleanBaseUrl.endsWith('/openwa')) {
+      try {
+        const probeRes = await fetch(`${cleanBaseUrl}/api/health`, {
+          headers: { 'x-api-key': finalApiKey, 'Accept': 'application/json' },
+          signal: AbortSignal.timeout(8000)
+        });
+        if (probeRes.ok) {
+          const probeJson = await probeRes.json().catch(() => null);
+          if (probeJson && probeJson.bridge === 'ready') {
+            const owaSubRes = await fetch(`${cleanBaseUrl}/openwa/api/health/live`, {
+              signal: AbortSignal.timeout(8000)
+            }).catch(() => null);
+            if (owaSubRes && owaSubRes.ok) {
+              cleanBaseUrl = `${cleanBaseUrl}/openwa`;
+            } else {
+              return res.status(400).json({
+                error: `"${cleanBaseUrl}" is running in Node mode, NOT Docker mode — OpenWA is not installed on that service! On Render, an existing Node service cannot be converted to Docker: click "New + → Web Service", choose Language = "Docker", and deploy a NEW Docker service.`
+              });
+            }
+          }
+        }
+      } catch (_) {
+        // Host may still be spinning up; proceed and let gateway.checkHealth() report status.
+      }
     }
 
     await saveGatewayConfig({
@@ -1022,6 +1051,7 @@ function createApp(options = {}) {
               method: 'POST',
               body: JSON.stringify({ base_url, api_key })
             });
+            if (data.base_url) document.getElementById('gwBaseUrl').value = data.base_url;
             document.getElementById('gwApiKey').value = '';
             document.getElementById('gwKeyHint').textContent = data.masked_api_key ? ('(saved: ' + data.masked_api_key + ')') : '';
             const gw = data.openwa || {};

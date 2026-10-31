@@ -188,6 +188,18 @@ class OpenWAGateway {
     try {
       const { client } = await this.getClient();
       const health = await client.health.check();
+      if (health && health.bridge === 'ready') {
+        const hasOpenwaSubpath = !baseUrl.endsWith('/openwa');
+        return {
+          reachable: false,
+          ready: false,
+          is_bridge_root: true,
+          base_url: baseUrl,
+          error: hasOpenwaSubpath
+            ? `URL "${baseUrl}" points to CarryBee Bridge root instead of "/openwa" (or that host was deployed in Node mode instead of Docker mode).`
+            : `URL "${baseUrl}" is not running OpenWA.`
+        };
+      }
       return {
         reachable: true,
         ready: true,

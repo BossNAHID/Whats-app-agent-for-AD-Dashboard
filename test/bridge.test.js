@@ -601,18 +601,32 @@ test('Vercel + Supabase dynamic /api/gateway-config links cleanly to a Docker ho
     });
     assert.equal(forbiddenRes.status, 403);
 
-    // Master admin links Vercel to Docker host's `/openwa` endpoint via POST /api/gateway-config
+    // Pasting a Node-only CarryBee Bridge URL (no /openwa passthrough) is rejected with a clear 400 error
+    const nodeModeRes = await fetch(`${vercelHost.url}/api/gateway-config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': 'master-bridge-key' },
+      body: JSON.stringify({
+        base_url: `${vercelHost.url}/`,
+        api_key: mockOwa.apiKey
+      })
+    });
+    assert.equal(nodeModeRes.status, 400);
+    const nodeModeJson = await nodeModeRes.json();
+    assert.match(nodeModeJson.error, /Node mode, NOT Docker mode/);
+
+    // Pasting a Docker CarryBee Bridge root URL WITHOUT `/openwa` auto-appends `/openwa` and connects!
     const linkRes = await fetch(`${vercelHost.url}/api/gateway-config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': 'master-bridge-key' },
       body: JSON.stringify({
-        base_url: `${dockerHost.url}/openwa`,
+        base_url: `${dockerHost.url}/`,
         api_key: mockOwa.apiKey
       })
     });
     assert.equal(linkRes.status, 200);
     const linkJson = await linkRes.json();
     assert.equal(linkJson.ok, true);
+    assert.equal(linkJson.base_url, `${dockerHost.url}/openwa`);
     assert.equal(linkJson.storage_backend, 'supabase');
     assert.equal(linkJson.openwa.ready, true);
     assert.match(linkJson.masked_api_key, /^owa_k1_01••••cdef$/);
