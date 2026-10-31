@@ -1,0 +1,46 @@
+# CarryBee WhatsApp Bridge + OpenWA Gateway (for Ubuntu KVM VPS / Local Docker)
+# Quick start:
+#   cp .env.example .env
+#   # edit .env with API_KEY, TURSO_DB_URL, TURSO_DB_TOKEN
+#   docker compose up -d --build
+
+services:
+  carrybee-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: carrybee-openwa-bridge
+    restart: unless-stopped
+    stop_grace_period: 75s
+    pids_limit: 2048
+    tmpfs:
+      - /tmp
+    ports:
+      # Public CarryBee Bridge API & /admin UI (used by AD Dashboard)
+      - "${BRIDGE_BIND_HOST:-0.0.0.0}:${PORT:-3000}:3000"
+      # Optional: OpenWA's own React Dashboard & Swagger API (bound to localhost by default for safety)
+      - "${OPENWA_BIND_HOST:-127.0.0.1}:${OPENWA_PORT:-2785}:2785"
+    environment:
+      - NODE_ENV=production
+      - TZ=${TZ:-Asia/Dhaka}
+      - HOME=/tmp
+      - XDG_CONFIG_HOME=/tmp/.config
+      - XDG_CACHE_HOME=/tmp/.cache
+      # CarryBee Bridge settings
+      - PORT=3000
+      - API_KEY=${API_KEY:-changeme}
+      - ADMIN_KEYS=${ADMIN_KEYS:-}
+      - TURSO_DB_URL=${TURSO_DB_URL:-}
+      - TURSO_DB_TOKEN=${TURSO_DB_TOKEN:-}
+      # OpenWA Gateway settings (whatsapp-web.js Chromium engine by default — avoids Signal SenderKey issues)
+      - OPENWA_INTERNAL_PORT=2785
+      - NODE_ID=${NODE_ID:-carrybee-openwa-1}
+      - AUTO_START_SESSIONS=${AUTO_START_SESSIONS:-true}
+      - STATUS_SEED_ON_READY=${STATUS_SEED_ON_READY:-false}
+      - ENGINE_TYPE=${ENGINE_TYPE:-}
+      - API_MASTER_KEY=${OPENWA_API_KEY:-}
+      - OPENWA_API_KEY=${OPENWA_API_KEY:-}
+      - CSP_UPGRADE_INSECURE_REQUESTS=${CSP_UPGRADE_INSECURE_REQUESTS:-false}
+    volumes:
+      # Persists WhatsApp login sessions, Chromium profiles, and OpenWA SQLite DB across restarts
+      - ./openwa-data:/app/data
