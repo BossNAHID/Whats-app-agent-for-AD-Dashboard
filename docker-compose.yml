@@ -1,7 +1,7 @@
 # CarryBee WhatsApp Bridge + OpenWA Gateway (for Ubuntu KVM VPS / Local Docker)
 # Quick start:
 #   cp .env.example .env
-#   # edit .env with API_KEY, TURSO_DB_URL, TURSO_DB_TOKEN
+#   # edit .env with API_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, PUBLIC_GATEWAY_URL
 #   docker compose up -d --build
 
 services:
@@ -16,7 +16,7 @@ services:
     tmpfs:
       - /tmp
     ports:
-      # Public CarryBee Bridge API & /admin UI (used by AD Dashboard)
+      # Public CarryBee Bridge API + OpenWA SDK passthrough (used by Vercel & AD Dashboard)
       - "${BRIDGE_BIND_HOST:-0.0.0.0}:${PORT:-3000}:3000"
       # Optional: OpenWA's own React Dashboard & Swagger API (bound to localhost by default for safety)
       - "${OPENWA_BIND_HOST:-127.0.0.1}:${OPENWA_PORT:-2785}:2785"
@@ -26,10 +26,13 @@ services:
       - HOME=/tmp
       - XDG_CONFIG_HOME=/tmp/.config
       - XDG_CACHE_HOME=/tmp/.cache
-      # CarryBee Bridge settings
+      # CarryBee Bridge + Supabase settings
       - PORT=3000
       - API_KEY=${API_KEY:-changeme}
       - ADMIN_KEYS=${ADMIN_KEYS:-}
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY:-}
+      - PUBLIC_GATEWAY_URL=${PUBLIC_GATEWAY_URL:-}
       - TURSO_DB_URL=${TURSO_DB_URL:-}
       - TURSO_DB_TOKEN=${TURSO_DB_TOKEN:-}
       # OpenWA Gateway settings (whatsapp-web.js Chromium engine by default — avoids Signal SenderKey issues)

@@ -1,24 +1,23 @@
-# Render Blueprint — Temporary Docker deployment (OpenWA + CarryBee Bridge)
+# Render Blueprint — OpenWA Engine Docker deployment (connects automatically to Vercel + Supabase!)
 # Defaults to `plan: free` so you can deploy on Render with NO credit card while waiting for your VPS!
-# - On 512 MB (`free`/`starter`), `carrybee-start.sh` automatically selects OpenWA's lightweight
-#   `baileys` engine so 3+ accounts fit in 512 MB without crashing.
-# - On >= 2 GB RAM (your 3 GB KVM VPS, or Render `standard` + Disk), it automatically runs
-#   `whatsapp-web.js` (headless Chromium).
+# - Set SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY in Render Environment, and this container will
+#   automatically register its RENDER_EXTERNAL_URL + OpenWA API Key in Supabase so your permanent
+#   Vercel bridge connects immediately!
 
 services:
   - type: web
-    name: carrybee-openwa-bridge
+    name: carrybee-openwa-engine
     runtime: docker
     plan: free
     healthCheckPath: /api/health
     envVars:
       - key: API_KEY
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
       - key: ADMIN_KEYS
-        sync: false
-      - key: TURSO_DB_URL
-        sync: false
-      - key: TURSO_DB_TOKEN
         sync: false
       - key: NODE_ID
         value: carrybee-openwa-1
