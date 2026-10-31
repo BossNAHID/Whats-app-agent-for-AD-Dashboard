@@ -13,7 +13,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const { createKVStore, SupabaseKVStore } = require('./supabase-store');
-const { OpenWAGateway } = require('./openwa-gateway');
+const { OpenWAGateway, hasBundledOpenWA } = require('./openwa-gateway');
 
 const DEFAULT_ACCOUNT_ID = 'default';
 
@@ -296,7 +296,7 @@ function createApp(options = {}) {
   // so single-port Docker hosts (like Render Free or VPS :3000) can seamlessly act as the remote
   // OpenWA engine for the permanent Vercel + Supabase front-end with zero route collisions.
   const localOpenwaTarget = options.localOpenwaProxyTarget
-    || (fs.existsSync('/app/dist/main')
+    || (hasBundledOpenWA()
       ? `http://127.0.0.1:${process.env.OPENWA_INTERNAL_PORT || 2785}`
       : null);
 
@@ -1227,7 +1227,7 @@ function createApp(options = {}) {
     // auto-register this OpenWA Gateway URL + API key so the Vercel front-end links automatically.
     const publicGatewayUrl = (process.env.PUBLIC_GATEWAY_URL || process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
     const localOpenwaKey = (process.env.OPENWA_API_KEY || '').trim();
-    if (publicGatewayUrl && localOpenwaKey && fs.existsSync('/app/dist/main')) {
+    if (publicGatewayUrl && localOpenwaKey && hasBundledOpenWA()) {
       const gatewayEndpoint = publicGatewayUrl.endsWith('/openwa')
         ? publicGatewayUrl
         : `${publicGatewayUrl}/openwa`;

@@ -12,6 +12,12 @@ const {
 const DEFAULT_BASE_URL = 'http://127.0.0.1:2785';
 const DEFAULT_KEY_FILE = '/app/data/.api-key';
 
+function hasBundledOpenWA() {
+  return process.env.CARRYBEE_BUNDLED_OPENWA === 'true'
+    || fs.existsSync('/app/dist/main.js')
+    || fs.existsSync('/app/dist/main');
+}
+
 function toSessionName(accountId) {
   const raw = String(accountId || 'default').trim().toLowerCase();
   let cleaned = raw
@@ -112,7 +118,7 @@ class OpenWAGateway {
 
   isMissingBundledOpenWA(baseUrl, hasExplicitGateway) {
     const isLocalDefault = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(baseUrl);
-    return isLocalDefault && !hasExplicitGateway && !fs.existsSync('/app/dist/main');
+    return isLocalDefault && !hasExplicitGateway && !hasBundledOpenWA();
   }
 
   async getClient() {
@@ -514,5 +520,6 @@ class OpenWAGateway {
 module.exports = {
   OpenWAGateway,
   toSessionName,
-  formatConnectedIdentity
+  formatConnectedIdentity,
+  hasBundledOpenWA
 };
