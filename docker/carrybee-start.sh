@@ -13,16 +13,25 @@ fi
 
 KEY_FILE="${OPENWA_KEY_FILE:-/app/data/.api-key}"
 
-# Resolve or pre-seed the OpenWA admin key BEFORE launching either process,
-# so CarryBee Bridge has a valid key immediately from millisecond 0 (no race on cold boot).
-RESOLVED_OPENWA_KEY="${OPENWA_API_KEY:-${API_MASTER_KEY:-}}"
-if [ -z "$RESOLVED_OPENWA_KEY" ] && [ -s "$KEY_FILE" ]; then
+RESOLVED_OPENWA_KEY=""
+SEED_MASTER_KEY=""
+
+# 1. On warm restart with a persistent /app/data volume, OpenWA's SQLite DB already
+#    stores the hashed master key from first boot (mirrored in $KEY_FILE).
+if [ -s "$KEY_FILE" ]; then
   RESOLVED_OPENWA_KEY="$(tr -d '\r\n ' < "$KEY_FILE")"
 fi
 
-SEED_MASTER_KEY=""
+# 2. On first boot (empty /app/data), accept explicit OPENWA_API_KEY / API_MASTER_KEY (>=32 chars)
+#    or generate a cryptographically random 71-char `owa_k1_<64-hex>` key, save it to $KEY_FILE,
+#    and export API_MASTER_KEY to OpenWA so both processes share the exact same key from ms 0.
 if [ -z "$RESOLVED_OPENWA_KEY" ]; then
-  RESOLVED_OPENWA_KEY="$(node -e "process.stdout.write('owa_k1_' + require('crypto').randomBytes(32).toString('hex'))")"
+  CANDIDATE_KEY="${OPENWA_API_KEY:-${API_MASTER_KEY:-}}"
+  if [ "${#CANDIDATE_KEY}" -ge 32 ]; then
+    RESOLVED_OPENWA_KEY="$CANDIDATE_KEY"
+  else
+    RESOLVED_OPENWA_KEY="$(node -e "process.stdout.write('owa_k1_' + require('crypto').randomBytes(32).toString('hex'))")"
+  fi
   SEED_MASTER_KEY="$RESOLVED_OPENWA_KEY"
   mkdir -p "$(dirname "$KEY_FILE")"
   umask 077
@@ -90,6 +99,7 @@ OPENWA_PID=$!
 (
   cd /opt/carrybee-bridge
   export PORT="$BRIDGE_PORT"
+  export CARRYBEE_BUNDLED_OPENWA="true"
   export OPENWA_BASE_URL="${OPENWA_BASE_URL:-http://127.0.0.1:${OPENWA_INTERNAL_PORT}}"
   export OPENWA_API_KEY="$RESOLVED_OPENWA_KEY"
   export OPENWA_KEY_FILE="$KEY_FILE"
